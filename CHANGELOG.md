@@ -22,6 +22,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+### Fixed
+
+- **Default excludes restored to `**/.venv` and `**/venv`.** 0.4.2 emptied `DEFAULT_EXCLUDES` without touching the README or the two tests that assert a virtualenv is pruned, so the suite was red and a default run scanned and deleted inside local virtualenvs. The 0.4.2 note below no longer describes the shipped behaviour.
+
+- **Config-file mode applies `--path`, `--glob`, `--preset` and `--format json`.** `-c` dispatched to a helper that read only a subset of the flags, so `rclean -c --path other-dir` cleaned the directory named in the config file instead of the one named on the command line -- the wrong scope for a deletion tool, reported as success. Pattern resolution and job reporting are now shared with non-config mode, `--list` answers before any config is loaded, and `-w` / `--write-configfile` conflicts with `-c` rather than being silently dropped. `--path` now defaults to `.` at the point of use instead of in the parser, which is how config mode tells an explicit path from an unset one.
+
+- **Traversal skips a directory whose path will not canonicalize.** The containment check read a `canonicalize()` error as proof the directory was inside the working directory, so a permission failure, or a directory replaced by a symlink mid-walk, let the scan descend and match outside the root. Such a directory is now skipped with a warning.
+
 ## [0.4.2]
 
 ## Changes

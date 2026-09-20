@@ -136,7 +136,11 @@ fn test_git_file_marks_a_submodule_root() {
 fn test_excluded_projects_keep_their_build_output() {
     let temp_dir = TempDir::new().unwrap();
     let base = temp_dir.path();
-    create_project(&base.join(".venv").join("src").join("pkg"), "setup.py", "build");
+    create_project(
+        &base.join(".venv").join("src").join("pkg"),
+        "setup.py",
+        "build",
+    );
 
     let job = run(base, true);
 

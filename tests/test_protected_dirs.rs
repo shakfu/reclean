@@ -176,4 +176,3 @@ remove_broken_symlinks = false
     let config: CleanConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.protected_dirs, PROTECTED_DIRS);
 }
-

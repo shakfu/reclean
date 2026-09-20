@@ -22,9 +22,9 @@ use rclean::{discover_config, parse_duration, CleanConfig, CleaningJob, Result};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Working Directory
-    #[arg(short, long, default_value_os = ".")]
-    path: String,
+    /// Working Directory [default: .]
+    #[arg(short, long)]
+    path: Option<String>,
 
     /// Specify custom glob pattern(s)
     #[arg(short, long)]
@@ -39,7 +39,7 @@ struct Args {
     configfile: Option<String>,
 
     /// Write default '.rclean.toml' file
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "configfile")]
     write_configfile: bool,
 
     /// Dry-run without actual removal
@@ -146,6 +146,52 @@ fn write_configfile(config: &CleanConfig) -> Result<()> {
     }
 }
 
+/// Resolve the patterns named on the command line, combining `--glob` with
+/// `--preset`. `None` when neither flag is given.
+fn resolve_patterns(args: &Args) -> Result<Option<Vec<String>>> {
+    if args.glob.is_none() && args.preset.is_none() {
+        return Ok(None);
+    }
+
+    let mut patterns = args.glob.clone().unwrap_or_default();
+    for name in args.preset.iter().flatten() {
+        match get_preset_patterns(name) {
+            Some(p) => patterns.extend(p),
+            None => {
+                return Err(rclean::CleanError::ConfigError(format!(
+                    "Unknown preset '{}'. Available: {}",
+                    name,
+                    PRESET_NAMES.join(", ")
+                )))
+            }
+        }
+    }
+    Ok(Some(patterns))
+}
+
+/// Run one job, report it in the requested format, and fail on failed deletions.
+fn run_job(config: CleanConfig) -> Result<()> {
+    let json_mode = config.json_mode;
+    let mut job = CleaningJob::new(config);
+    job.run()?;
+
+    if json_mode {
+        let json = job.to_json().map_err(|e| {
+            rclean::CleanError::ConfigError(format!("Failed to serialize JSON: {}", e))
+        })?;
+        println!("{}", json);
+    }
+
+    if job.has_failures() {
+        return Err(rclean::CleanError::ConfigError(format!(
+            "{} deletion(s) failed",
+            job.failed_deletions.len()
+        )));
+    }
+
+    Ok(())
+}
+
 /// Load config from file, then apply CLI overrides.
 /// If no explicit path is given, searches upward for `.rclean.toml`
 /// then falls back to `~/.config/rclean/config.toml`.
@@ -217,18 +263,15 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<(
     if let Some(ref duration_str) = args.older_than {
         config.older_than_secs = Some(parse_duration(duration_str)?);
     }
-
-    let mut job = CleaningJob::new(config);
-    job.run()?;
-
-    if job.has_failures() {
-        return Err(rclean::CleanError::ConfigError(format!(
-            "{} deletion(s) failed",
-            job.failed_deletions.len()
-        )));
+    if let Some(ref path) = args.path {
+        config.path = path.clone();
     }
+    if let Some(patterns) = resolve_patterns(args)? {
+        config.patterns = patterns;
+    }
+    config.json_mode = args.format == OutputFormat::Json;
 
-    Ok(())
+    run_job(config)
 }
 
 /// Execute the CLI logic, returning Result for clean error propagation
@@ -238,10 +281,6 @@ fn run(args: Args) -> Result<()> {
         let mut cmd = Args::command();
         generate(shell, &mut cmd, "rclean", &mut io::stdout());
         return Ok(());
-    }
-
-    if args.configfile.is_some() {
-        return run_job_from_configfile(args.configfile.clone(), &args);
     }
 
     if args.list {
@@ -267,49 +306,18 @@ fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    if args.configfile.is_some() {
+        return run_job_from_configfile(args.configfile.clone(), &args);
+    }
+
     // Parse duration if provided
     let older_than_secs = match args.older_than {
         Some(ref duration_str) => Some(parse_duration(duration_str)?),
         None => None,
     };
 
-    // Resolve patterns: --glob > --preset > defaults
-    let patterns = if let Some(glob_patterns) = args.glob {
-        // Explicit globs may be combined with presets
-        let mut combined = glob_patterns;
-        if let Some(ref presets) = args.preset {
-            for name in presets {
-                match get_preset_patterns(name) {
-                    Some(p) => combined.extend(p),
-                    None => {
-                        return Err(rclean::CleanError::ConfigError(format!(
-                            "Unknown preset '{}'. Available: {}",
-                            name,
-                            PRESET_NAMES.join(", ")
-                        )))
-                    }
-                }
-            }
-        }
-        combined
-    } else if let Some(ref presets) = args.preset {
-        let mut combined = Vec::new();
-        for name in presets {
-            match get_preset_patterns(name) {
-                Some(p) => combined.extend(p),
-                None => {
-                    return Err(rclean::CleanError::ConfigError(format!(
-                        "Unknown preset '{}'. Available: {}",
-                        name,
-                        PRESET_NAMES.join(", ")
-                    )))
-                }
-            }
-        }
-        combined
-    } else {
-        get_default_patterns()
-    };
+    // Resolve patterns: --glob and --preset combine, otherwise the defaults
+    let patterns = resolve_patterns(&args)?.unwrap_or_else(get_default_patterns);
 
     // The defaults carry `--exclude` unless the run opts out of them entirely
     let mut exclude_patterns = if args.no_protect {
@@ -317,10 +325,10 @@ fn run(args: Args) -> Result<()> {
     } else {
         get_default_excludes()
     };
-    exclude_patterns.extend(args.exclude.unwrap_or_default());
+    exclude_patterns.extend(args.exclude.clone().unwrap_or_default());
 
     let config = CleanConfig::builder()
-        .path(args.path)
+        .path(args.path.clone().unwrap_or_else(|| ".".to_string()))
         .patterns(patterns)
         .exclude_patterns(exclude_patterns)
         .dry_run(args.dry_run)
@@ -343,25 +351,7 @@ fn run(args: Args) -> Result<()> {
         return write_configfile(&config);
     }
 
-    let json_mode = args.format == OutputFormat::Json;
-    let mut job = CleaningJob::new(config);
-    job.run()?;
-
-    if json_mode {
-        let json = job.to_json().map_err(|e| {
-            rclean::CleanError::ConfigError(format!("Failed to serialize JSON: {}", e))
-        })?;
-        println!("{}", json);
-    }
-
-    if job.has_failures() {
-        return Err(rclean::CleanError::ConfigError(format!(
-            "{} deletion(s) failed",
-            job.failed_deletions.len()
-        )));
-    }
-
-    Ok(())
+    run_job(config)
 }
 
 /// main function

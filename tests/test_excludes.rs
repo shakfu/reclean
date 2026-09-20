@@ -107,4 +107,6 @@ remove_broken_symlinks = false
 "#;
     let config: CleanConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.exclude_patterns, DEFAULT_EXCLUDES);
+    // Named outright, so an emptied DEFAULT_EXCLUDES cannot satisfy the check above
+    assert_eq!(config.exclude_patterns, vec!["**/.venv", "**/venv"]);
 }

@@ -26,8 +26,7 @@ pub fn get_protected_dirs() -> Vec<String> {
 /// hundred, all of which the default patterns match. This is an ordinary
 /// exclude, not protection: `--no-protect` drops it, `exclude_patterns` in a
 /// config file replaces it, and naming a virtualenv on `--path` cleans it.
-// pub const DEFAULT_EXCLUDES: &[&str] = &["**/.venv", "**/venv"];
-pub const DEFAULT_EXCLUDES: &[&str] = &[];
+pub const DEFAULT_EXCLUDES: &[&str] = &["**/.venv", "**/venv"];
 
 /// The default exclude patterns, owned.
 pub fn get_default_excludes() -> Vec<String> {

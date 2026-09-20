@@ -560,16 +560,21 @@ impl Scan<'_> {
         // through a symlinked ancestor. Checking each directory once therefore
         // covers every entry in it, for one `realpath` per directory rather than
         // one per match.
-        let safe = dir
-            .canonicalize()
-            .map(|c| c.starts_with(self.base_path))
-            .unwrap_or(true);
-        if !safe {
-            warn!(
-                "Skipping path outside working directory: {:?}",
-                dir.display()
-            );
-            return Vec::new();
+        match dir.canonicalize() {
+            Ok(resolved) if resolved.starts_with(self.base_path) => {}
+            Ok(_) => {
+                warn!(
+                    "Skipping path outside working directory: {:?}",
+                    dir.display()
+                );
+                return Vec::new();
+            }
+            // A directory that will not resolve cannot be shown to be inside
+            // `base_path`, so it is skipped rather than walked.
+            Err(e) => {
+                warn!("Skipping unresolvable path {:?}: {}", dir.display(), e);
+                return Vec::new();
+            }
         }
 
         let entries = match fs::read_dir(&dir) {
@@ -650,9 +655,8 @@ impl Scan<'_> {
         }
 
         // Check if path matches include patterns, or is build output when asked for
-        let artifact = self.config.build_artifacts
-            && is_dir
-            && name.is_some_and(|n| is_artifact_dir(path, n));
+        let artifact =
+            self.config.build_artifacts && is_dir && name.is_some_and(|n| is_artifact_dir(path, n));
 
         if !artifact && !self.include_set.is_match(path) {
             return is_dir;
@@ -667,7 +671,12 @@ impl Scan<'_> {
         // matcher pass is skipped when neither is on.
         let pattern = if self.config.stats_mode || self.config.json_mode {
             find_matching_pattern(self.matchers, path).unwrap_or_else(|| {
-                if artifact { "build-artifact" } else { "unknown" }.to_string()
+                if artifact {
+                    "build-artifact"
+                } else {
+                    "unknown"
+                }
+                .to_string()
             })
         } else {
             String::new()
