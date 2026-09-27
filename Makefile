@@ -1,9 +1,13 @@
 
-.PHONY: all build test check clippy fmt lint doc clean install uninstall publish publish-dry
+.PHONY: all build release test check clippy fmt lint doc clean \
+		install uninstall publish publish-dry
 
 all: build
 
 build:
+	@cargo build
+
+release:
 	@cargo build --release
 
 test:
@@ -26,8 +30,8 @@ doc:
 clean:
 	@rm -rf target
 
-install: build
-	@cp target/release/reclean /usr/local/bin/
+install: release
+	@cp target/release/reclean ~/.local/bin/
 	@echo "reclean installed"
 
 uninstall:
