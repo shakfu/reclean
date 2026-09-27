@@ -53,13 +53,13 @@ mod tests {
 
     #[test]
     fn test_toml_load() {
-        let contents = fs::read_to_string("tests/.rclean.toml").expect("cannot read file");
+        let contents = fs::read_to_string("tests/.reclean.toml").expect("cannot read file");
         assert!(!contents.is_empty());
     }
 
     #[test]
     fn test_toml_table_from_file() {
-        let contents = fs::read_to_string("tests/.rclean.toml").expect("cannot read file");
+        let contents = fs::read_to_string("tests/.reclean.toml").expect("cannot read file");
         let table = contents.parse::<Table>().unwrap();
         assert_eq!(table["path"].as_str(), Some("."));
         //let array = table["patterns"].as_array();

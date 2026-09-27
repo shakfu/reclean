@@ -1,4 +1,4 @@
-use rclean::{CleanConfig, CleaningJob};
+use reclean::{CleanConfig, CleaningJob};
 use std::fs;
 use std::time::{Duration, SystemTime};
 use tempfile::TempDir;
@@ -485,4 +485,183 @@ fn test_nested_matching_directories_counted_once() {
     assert_eq!(job.size, 50);
     assert!(!outer.exists());
     assert!(!job.has_failures());
+}
+
+/// Set the mtime of `path` to `secs` seconds ago
+fn backdate(path: &std::path::Path, secs: u64) {
+    let then = SystemTime::now() - Duration::from_secs(secs);
+    filetime::set_file_mtime(path, filetime::FileTime::from_system_time(then)).unwrap();
+}
+
+fn run_older_than(base: &std::path::Path, secs: u64) -> CleaningJob {
+    let config = CleanConfig::builder()
+        .path(base.to_str().unwrap())
+        .patterns(vec!["**/__pycache__".to_string(), "**/*.pyc".to_string()])
+        .skip_confirmation(true)
+        .older_than_secs(Some(secs))
+        .build();
+    let mut job = CleaningJob::new(config);
+    job.run().unwrap();
+    job
+}
+
+#[test]
+fn test_older_than_keeps_old_directory_with_recent_contents() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let cache = base.join("__pycache__");
+    fs::create_dir_all(cache.join("sub")).unwrap();
+    fs::write(cache.join("old.pyc"), "old").unwrap();
+    fs::write(cache.join("sub").join("new.pyc"), "new").unwrap();
+    backdate(&cache.join("old.pyc"), 7200);
+    backdate(&cache.join("sub"), 7200);
+    // Written last, since adding entries updates a directory's mtime
+    backdate(&cache, 7200);
+
+    let job = run_older_than(base, 3600);
+
+    // The directory's own mtime is old, but `sub/new.pyc` is not
+    assert_eq!(job.counter, 0);
+    assert!(cache.join("sub").join("new.pyc").exists());
+}
+
+#[test]
+fn test_older_than_removes_directory_when_everything_is_old() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let cache = base.join("__pycache__");
+    fs::create_dir_all(cache.join("sub")).unwrap();
+    fs::write(cache.join("sub").join("a.pyc"), "old").unwrap();
+    backdate(&cache.join("sub").join("a.pyc"), 7200);
+    backdate(&cache.join("sub"), 7200);
+    backdate(&cache, 7200);
+
+    let job = run_older_than(base, 3600);
+
+    assert_eq!(job.counter, 1);
+    assert!(job.size > 0);
+    assert!(!cache.exists());
+}
+
+#[test]
+fn test_older_than_keeps_old_directory_with_a_new_subdirectory() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let cache = base.join("__pycache__");
+    fs::create_dir_all(cache.join("empty")).unwrap();
+    backdate(&cache, 7200);
+
+    let job = run_older_than(base, 3600);
+
+    assert_eq!(job.counter, 0);
+    assert!(cache.join("empty").exists());
+}
+
+#[test]
+fn test_older_than_keeps_future_timestamps() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let file = base.join("future.pyc");
+    fs::write(&file, "x").unwrap();
+    let later = SystemTime::now() + Duration::from_secs(86400);
+    filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(later)).unwrap();
+
+    let job = run_older_than(base, 3600);
+
+    assert_eq!(job.counter, 0);
+    assert!(file.exists());
+}
+
+#[test]
+fn test_older_than_beyond_the_clock_matches_nothing() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let file = base.join("old.pyc");
+    fs::write(&file, "x").unwrap();
+    backdate(&file, 7200);
+
+    let job = run_older_than(base, u64::MAX);
+
+    assert_eq!(job.counter, 0);
+    assert!(file.exists());
+}
+
+/// Make `dir` unreadable, returning false when the permission has no effect
+/// (running as root)
+#[cfg(unix)]
+fn lock(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::read_dir(dir).is_err()
+}
+
+#[cfg(unix)]
+fn unlock(dir: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn test_unreadable_directory_is_a_warning() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let locked = base.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("hidden.pyc"), "x").unwrap();
+    fs::write(base.join("seen.pyc"), "x").unwrap();
+    if !lock(&locked) {
+        unlock(&locked);
+        return;
+    }
+
+    let config = CleanConfig::builder()
+        .path(base.to_str().unwrap())
+        .patterns(vec!["**/*.pyc".to_string()])
+        .dry_run(true)
+        .json_mode(true)
+        .build();
+    let mut job = CleaningJob::new(config);
+    let result = job.run();
+    unlock(&locked);
+    result.unwrap();
+
+    assert_eq!(job.counter, 1);
+    assert!(job.has_warnings());
+    assert_eq!(job.warnings[0].0, locked);
+
+    let json: serde_json::Value = serde_json::from_str(&job.to_json().unwrap()).unwrap();
+    assert_eq!(json["warnings"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn test_older_than_keeps_directory_with_unreadable_contents() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    let cache = base.join("__pycache__");
+    let locked = cache.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    backdate(&locked, 7200);
+    backdate(&cache, 7200);
+    if !lock(&locked) {
+        unlock(&locked);
+        return;
+    }
+
+    let config = CleanConfig::builder()
+        .path(base.to_str().unwrap())
+        .patterns(vec!["**/__pycache__".to_string()])
+        .skip_confirmation(true)
+        .older_than_secs(Some(3600))
+        .build();
+    let mut job = CleaningJob::new(config);
+    let result = job.run();
+    unlock(&locked);
+    result.unwrap();
+
+    // The age of `locked`'s contents is unknown, so the target is kept
+    assert_eq!(job.counter, 0);
+    assert!(job.has_warnings());
+    assert!(cache.exists());
 }

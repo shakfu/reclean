@@ -1,2 +1,2 @@
 cargo build --release
-cp target/release/rclean /usr/local/bin/
+cp target/release/reclean /usr/local/bin/

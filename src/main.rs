@@ -5,15 +5,15 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{generate, Shell};
 use log::{error, info};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 
-use rclean::constants::{
-    get_artifact_dirs, get_default_excludes, get_default_patterns, get_preset_patterns,
-    get_protected_dirs, DEFAULT_EXCLUDES, PRESET_NAMES, SETTINGS_FILENAME,
+use reclean::constants::{
+    get_artifact_dirs, get_default_excludes, get_default_patterns, get_dependency_dirs,
+    get_protected_dirs, DEFAULT_EXCLUDES, SETTINGS_FILENAME,
 };
-use rclean::{discover_config, parse_duration, CleanConfig, CleaningJob, Result};
+use reclean::{discover_config, parse_duration, parse_size, CleanConfig, CleaningJob, Result};
 
 // --------------------------------------------------------------------
 // cli api
@@ -34,11 +34,11 @@ struct Args {
     #[arg(short, long)]
     exclude: Option<Vec<String>>,
 
-    /// Configure from config file (searches upward then ~/.config/rclean/ if no path given)
+    /// Configure from config file (searches upward then ~/.config/reclean/ if no path given)
     #[arg(short, long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     configfile: Option<String>,
 
-    /// Write default '.rclean.toml' file
+    /// Write default '.reclean.toml' file
     #[arg(short, long, conflicts_with = "configfile")]
     write_configfile: bool,
 
@@ -62,6 +62,10 @@ struct Args {
     #[arg(short = 'B', long)]
     build_artifacts: bool,
 
+    /// Also match dependency trees beside their lock file (node_modules, .venv, vendor)
+    #[arg(short = 'D', long)]
+    dependencies: bool,
+
     /// Display statistics by pattern
     #[arg(short = 's', long)]
     stats: bool,
@@ -69,6 +73,10 @@ struct Args {
     /// Only remove files older than specified duration (e.g., "30d", "7d", "24h", "3600s")
     #[arg(short = 'o', long)]
     older_than: Option<String>,
+
+    /// Only remove targets of at least this size (e.g., "100M", "1.5G", "4096")
+    #[arg(long, value_name = "SIZE")]
+    larger_than: Option<String>,
 
     /// Show progress bar during scanning
     #[arg(short = 'P', long)]
@@ -85,10 +93,6 @@ struct Args {
     /// Suppress all output except errors
     #[arg(short = 'q', long)]
     quiet: bool,
-
-    /// Use a named preset pattern group (common, python, node, rust, java, c, go, all)
-    #[arg(long)]
-    preset: Option<Vec<String>>,
 
     /// Generate shell completions (bash, zsh, fish, elvish, powershell)
     #[arg(long, value_name = "SHELL")]
@@ -128,10 +132,10 @@ fn init_logging(level: simplelog::LevelFilter) {
     .expect("could not initialize logging");
 }
 
-/// Generate default config file: '.rclean.toml'
+/// Generate default config file: '.reclean.toml'
 fn write_configfile(config: &CleanConfig) -> Result<()> {
     let toml = toml::to_string(config).map_err(|e| {
-        rclean::CleanError::ConfigError(format!("Failed to serialize config: {}", e))
+        reclean::CleanError::ConfigError(format!("Failed to serialize config: {}", e))
     })?;
 
     let cfg_out = Path::new(SETTINGS_FILENAME);
@@ -140,67 +144,48 @@ fn write_configfile(config: &CleanConfig) -> Result<()> {
         fs::write(cfg_out, toml)?;
         Ok(())
     } else {
-        Err(rclean::CleanError::ConfigError(format!(
+        Err(reclean::CleanError::ConfigError(format!(
             "Cannot overwrite existing '{SETTINGS_FILENAME}' file"
         )))
     }
 }
 
-/// Resolve the patterns named on the command line, combining `--glob` with
-/// `--preset`. `None` when neither flag is given.
-fn resolve_patterns(args: &Args) -> Result<Option<Vec<String>>> {
-    if args.glob.is_none() && args.preset.is_none() {
-        return Ok(None);
-    }
+/// Exit status for a run that completed but could not read part of the tree
+const EXIT_WARNINGS: i32 = 3;
 
-    let mut patterns = args.glob.clone().unwrap_or_default();
-    for name in args.preset.iter().flatten() {
-        match get_preset_patterns(name) {
-            Some(p) => patterns.extend(p),
-            None => {
-                return Err(rclean::CleanError::ConfigError(format!(
-                    "Unknown preset '{}'. Available: {}",
-                    name,
-                    PRESET_NAMES.join(", ")
-                )))
-            }
-        }
-    }
-    Ok(Some(patterns))
-}
-
-/// Run one job, report it in the requested format, and fail on failed deletions.
-fn run_job(config: CleanConfig) -> Result<()> {
+/// Run one job, report it in the requested format, and return its exit status.
+fn run_job(config: CleanConfig) -> Result<i32> {
     let json_mode = config.json_mode;
     let mut job = CleaningJob::new(config);
     job.run()?;
 
     if json_mode {
         let json = job.to_json().map_err(|e| {
-            rclean::CleanError::ConfigError(format!("Failed to serialize JSON: {}", e))
+            reclean::CleanError::ConfigError(format!("Failed to serialize JSON: {}", e))
         })?;
         println!("{}", json);
     }
 
     if job.has_failures() {
-        return Err(rclean::CleanError::ConfigError(format!(
-            "{} deletion(s) failed",
-            job.failed_deletions.len()
-        )));
+        error!("{} deletion(s) failed", job.failed_deletions.len());
+        return Ok(1);
+    }
+    if job.has_warnings() {
+        return Ok(EXIT_WARNINGS);
     }
 
-    Ok(())
+    Ok(0)
 }
 
 /// Load config from file, then apply CLI overrides.
-/// If no explicit path is given, searches upward for `.rclean.toml`
-/// then falls back to `~/.config/rclean/config.toml`.
-fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<()> {
+/// If no explicit path is given, searches upward for `.reclean.toml`
+/// then falls back to `~/.config/reclean/config.toml`.
+fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<i32> {
     let resolved_path = if let Some(ref explicit) = config_path.filter(|s| !s.is_empty()) {
         // Explicit path provided -- use it directly
         let p = Path::new(explicit);
         if !p.exists() {
-            return Err(rclean::CleanError::ConfigError(format!(
+            return Err(reclean::CleanError::ConfigError(format!(
                 "Settings file '{}' not found",
                 explicit
             )));
@@ -209,11 +194,11 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<(
     } else {
         // No explicit path -- discover config
         let cwd = std::env::current_dir().map_err(|e| {
-            rclean::CleanError::ConfigError(format!("Cannot get current directory: {}", e))
+            reclean::CleanError::ConfigError(format!("Cannot get current directory: {}", e))
         })?;
         discover_config(&cwd).ok_or_else(|| {
-            rclean::CleanError::ConfigError(format!(
-                "No '{}' found in directory tree or global config (~/.config/rclean/config.toml)",
+            reclean::CleanError::ConfigError(format!(
+                "No '{}' found in directory tree or global config (~/.config/reclean/config.toml)",
                 SETTINGS_FILENAME
             ))
         })?
@@ -222,9 +207,11 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<(
     let config_file = resolved_path.to_str().unwrap_or(SETTINGS_FILENAME);
 
     info!("using settings file: {config_file:?}");
-    let contents = fs::read_to_string(config_file)?;
+    let contents = fs::read_to_string(config_file).map_err(|e| {
+        reclean::CleanError::ConfigError(format!("Cannot read {:?}: {}", config_file, e))
+    })?;
     let mut config: CleanConfig = toml::from_str(&contents).map_err(|e| {
-        rclean::CleanError::ConfigError(format!("Cannot deserialize from .toml: {}", e))
+        reclean::CleanError::ConfigError(format!("Cannot deserialize from .toml: {}", e))
     })?;
 
     // CLI flags override config file values when explicitly set
@@ -249,6 +236,9 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<(
     if args.build_artifacts {
         config.build_artifacts = true;
     }
+    if args.dependencies {
+        config.dependencies = true;
+    }
     if args.no_protect {
         config.protected_dirs.clear();
         // Only the built-in excludes go: patterns the config file names are the
@@ -263,47 +253,37 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<(
     if let Some(ref duration_str) = args.older_than {
         config.older_than_secs = Some(parse_duration(duration_str)?);
     }
+    if let Some(ref size) = args.larger_than {
+        config.larger_than_bytes = Some(parse_size(size)?);
+    }
     if let Some(ref path) = args.path {
         config.path = path.clone();
     }
-    if let Some(patterns) = resolve_patterns(args)? {
-        config.patterns = patterns;
+    if let Some(ref patterns) = args.glob {
+        config.patterns = patterns.clone();
     }
     config.json_mode = args.format == OutputFormat::Json;
+    config.config_file = Some(resolved_path.clone());
 
     run_job(config)
 }
 
-/// Execute the CLI logic, returning Result for clean error propagation
-fn run(args: Args) -> Result<()> {
+/// Execute the CLI logic, returning the exit status of a completed run
+fn run(args: Args) -> Result<i32> {
     // Generate shell completions and exit
     if let Some(shell) = args.completions {
         let mut cmd = Args::command();
-        generate(shell, &mut cmd, "rclean", &mut io::stdout());
-        return Ok(());
+        generate(shell, &mut cmd, "reclean", &mut io::stdout());
+        return Ok(0);
     }
 
     if args.list {
-        if let Some(ref presets) = args.preset {
-            for name in presets {
-                if let Some(patterns) = get_preset_patterns(name) {
-                    info!("{} preset patterns: {:?}", name, patterns);
-                } else {
-                    return Err(rclean::CleanError::ConfigError(format!(
-                        "Unknown preset '{}'. Available: {}",
-                        name,
-                        PRESET_NAMES.join(", ")
-                    )));
-                }
-            }
-        } else {
-            info!("default patterns: {:?}", get_default_patterns());
-            info!("available presets: {}", PRESET_NAMES.join(", "));
-            info!("protected directories: {:?}", get_protected_dirs());
-            info!("default excludes: {:?}", get_default_excludes());
-            info!("build artifact directories: {:?}", get_artifact_dirs());
-        }
-        return Ok(());
+        info!("default patterns: {:?}", get_default_patterns());
+        info!("protected directories: {:?}", get_protected_dirs());
+        info!("default excludes: {:?}", get_default_excludes());
+        info!("build artifact directories: {:?}", get_artifact_dirs());
+        info!("dependency directories: {:?}", get_dependency_dirs());
+        return Ok(0);
     }
 
     if args.configfile.is_some() {
@@ -315,9 +295,13 @@ fn run(args: Args) -> Result<()> {
         Some(ref duration_str) => Some(parse_duration(duration_str)?),
         None => None,
     };
+    let larger_than_bytes = match args.larger_than {
+        Some(ref size) => Some(parse_size(size)?),
+        None => None,
+    };
 
-    // Resolve patterns: --glob and --preset combine, otherwise the defaults
-    let patterns = resolve_patterns(&args)?.unwrap_or_else(get_default_patterns);
+    // `--glob` replaces the defaults
+    let patterns = args.glob.clone().unwrap_or_else(get_default_patterns);
 
     // The defaults carry `--exclude` unless the run opts out of them entirely
     let mut exclude_patterns = if args.no_protect {
@@ -340,6 +324,8 @@ fn run(args: Args) -> Result<()> {
         .show_progress(args.progress)
         .json_mode(args.format == OutputFormat::Json)
         .build_artifacts(args.build_artifacts)
+        .dependencies(args.dependencies)
+        .larger_than_bytes(larger_than_bytes)
         .protected_dirs(if args.no_protect {
             Vec::new()
         } else {
@@ -348,7 +334,7 @@ fn run(args: Args) -> Result<()> {
         .build();
 
     if args.write_configfile {
-        return write_configfile(&config);
+        return write_configfile(&config).map(|()| 0);
     }
 
     run_job(config)
@@ -368,8 +354,21 @@ fn main() {
     };
     init_logging(log_level);
 
-    if let Err(e) = run(args) {
-        error!("Error: {}", e);
-        process::exit(1);
+    match run(args) {
+        Ok(0) => {}
+        Ok(code) => {
+            // `process::exit` runs no destructors, so flush what was printed
+            let _ = io::stdout().flush();
+            process::exit(code);
+        }
+        Err(e) => {
+            error!("Error: {}", e);
+            // Usage and configuration errors are 2, as clap's own are
+            let code = match e {
+                reclean::CleanError::ConfigError(_) | reclean::CleanError::GlobError(_) => 2,
+                _ => 1,
+            };
+            process::exit(code);
+        }
     }
 }

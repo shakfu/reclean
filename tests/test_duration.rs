@@ -1,4 +1,4 @@
-use rclean::parse_duration;
+use reclean::parse_duration;
 
 #[test]
 fn test_parse_duration_seconds() {
@@ -59,4 +59,26 @@ fn test_parse_duration_invalid_number() {
 #[test]
 fn test_parse_duration_whitespace_trimmed() {
     assert_eq!(parse_duration("  30d  ").unwrap(), 2592000);
+}
+
+#[test]
+fn test_parse_duration_overflow_is_an_error() {
+    // Wrapping here would turn a huge age into a small one
+    assert!(parse_duration("18446744073709551615w").is_err());
+    assert!(parse_duration("30500568904944s").is_ok());
+    assert!(parse_duration("30500568904944w").is_err());
+    assert_eq!(parse_duration("18446744073709551615s").unwrap(), u64::MAX);
+}
+
+#[test]
+fn test_parse_duration_rejects_signs() {
+    assert!(parse_duration("+5d").is_err());
+    assert!(parse_duration("-5d").is_err());
+}
+
+#[test]
+fn test_parse_duration_multibyte_unit_is_an_error() {
+    // Used to panic slicing inside a multibyte char
+    assert!(parse_duration("5\u{e9}").is_err());
+    assert!(parse_duration("\u{e9}").is_err());
 }

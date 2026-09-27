@@ -1,4 +1,4 @@
-use rclean::{CleanConfig, CleaningJob};
+use reclean::{CleanConfig, CleaningJob};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
@@ -166,4 +166,47 @@ fn test_artifact_matches_are_named_in_stats() {
     job.run().unwrap();
 
     assert_eq!(job.stats.get("build-artifact").map(|(n, _)| *n), Some(1));
+}
+
+#[test]
+fn test_nested_repository_build_output_is_not_matched() {
+    // A submodule or vendored checkout inside an outer repository
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir(base.join(".git")).unwrap();
+    let nested = base.join("vendor").join("lib");
+    create_project(&nested, "Cargo.toml", "target");
+
+    let job = run(base, true);
+
+    assert_eq!(job.counter, 0);
+    assert!(nested.join("target").exists());
+}
+
+#[test]
+fn test_sibling_projects_under_a_plain_directory_are_matched() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    create_project(&base.join("a"), "Cargo.toml", "target");
+    create_project(&base.join("b"), "CMakeLists.txt", "build");
+
+    let job = run(base, true);
+
+    assert_eq!(job.counter, 2);
+    assert!(!base.join("a").join("target").exists());
+    assert!(!base.join("b").join("build").exists());
+}
+
+#[test]
+fn test_nested_repository_is_matched_when_named_as_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir(base.join(".git")).unwrap();
+    let nested = base.join("vendor").join("lib");
+    create_project(&nested, "Cargo.toml", "target");
+
+    let job = run(&nested, true);
+
+    assert_eq!(job.counter, 1);
+    assert!(!nested.join("target").exists());
 }

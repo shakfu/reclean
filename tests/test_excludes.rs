@@ -1,5 +1,5 @@
-use rclean::constants::DEFAULT_EXCLUDES;
-use rclean::{CleanConfig, CleaningJob};
+use reclean::constants::DEFAULT_EXCLUDES;
+use reclean::{CleanConfig, CleaningJob};
 use std::fs;
 use tempfile::TempDir;
 
@@ -96,7 +96,7 @@ fn test_excludes_are_replaceable() {
 
 #[test]
 fn test_config_without_exclude_patterns_field_gets_defaults() {
-    // A .rclean.toml written before the default excludes existed still gets them
+    // A .reclean.toml written before the default excludes existed still gets them
     let toml = r#"
 path = "."
 patterns = ["**/*.pyc"]

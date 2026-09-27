@@ -22,11 +22,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+## [0.5.0]
+
+### Changed
+
+- **Renamed to `reclean`, short for "recursive clean".** `rclean` is taken on crates.io by an unrelated tool that also installs an `rclean` binary. The package, binary, library crate (`use reclean::`), config file (`.reclean.toml`) and global config directory (`~/.config/reclean/`) all change. `.rclean.toml` is not read.
+
+### Added
+
+- **`-D` / `--dependencies` removes dependency trees beside their lock file.** `node_modules` beside `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml` or `bun.lock`; `.venv` beside `uv.lock`; `vendor` beside `go.mod`. The lock is the marker rather than the manifest because only a lock names the tree its restore command reinstalls. The restore command is printed beside each match and reported as `restore` in JSON. The built-in `.venv` exclude does not apply to a `.venv` matched this way.
+
+- **`--larger-than SIZE`** keeps only targets of at least a size, with binary `K`/`M`/`G`/`T` suffixes; config key `larger_than_bytes`.
+
+- **Matches carry a `reason`**: `pattern`, `broken-symlink`, `build-artifact` or `dependency`, ordered by restore cost. Text output prints a per-reason breakdown under the total when there is more than one. JSON adds `schema`, `config`, a `reasons` array, and `reason`, `type` and `restore` per match.
+
+- **The matched list shows sizes and a total** before the prompt.
+
+### Removed
+
+- **`--preset`.** `node`, `rust`, `java` and `go` matched `node_modules`, `target`, `build` and `vendor` by name, so `--preset java` removed any directory called `build`, source included. `-B` and `-D` match the same directories only beside a marker file. The default patterns are unchanged: they were `common` + `python` and are now one list. Name-only matching is still available with `-g`.
+
+### Changed
+
+- **Vim swap files (`*.swp`, `*.swo`) are no longer default patterns.** A swap file holds unsaved edits, so removing one while Vim is open deletes its only recovery copy.
+
+- **Targets are removed in parallel.** Results are still reported in list order. The closing summary counts only what was removed; it used to count every match, failures included.
+
+- **The confirmation prompt reads piped stdin.** It failed outright when stdin was not a terminal; now `echo y | reclean` proceeds and end of input cancels. On a terminal, keys typed before the prompt appears are discarded, so a stray `y` cannot answer it.
+
+- **Exit codes distinguish failure kinds.** 2 is a bad option or invalid configuration, 1 a missing root or failed removal, and 3 a run that completed but could not read part of the tree. Every failure used to exit 1, so a script could not tell "bad flag" from "deletion failed". Scripts that test for exactly 1 need updating.
+
+- **Unknown keys in a config file are an error.** serde ignored them, so `dry_rn = true` ran a real deletion.
+
+### Security
+
+- **`indicatif` 0.17 -> 0.18 and `dialoguer` 0.11 -> 0.12.** `indicatif` 0.17 pulled in `number_prefix`, which is unmaintained ([RUSTSEC-2025-0119](https://rustsec.org/advisories/RUSTSEC-2025-0119)). `dialoguer` moves with it so both use one `console` version.
+
+- **Each target is re-checked before removal.** It must still resolve inside the working directory and be the same device and inode the scan recorded. Removal re-resolved the path by name after the confirmation prompt, so a directory swapped for a symlink in that window was followed out of the tree. The window is now two adjacent syscalls; descriptor-relative removal would close it.
+
 ### Fixed
+
+- **`--older-than` ages a directory by its newest entry.** It used the directory's own mtime, which adding a file below the top level does not change, so `-o 30d` removed an old `__pycache__` together with files written that day. A target whose age cannot be shown -- future or unreadable timestamp, unlistable subdirectory -- is now kept rather than removed.
+
+- **Unreadable directories are reported.** `read_dir` and metadata errors were dropped, so a permission failure looked like an empty directory and the run reported success. Each is now a warning, listed under `warnings` in JSON output, and the run exits 3.
+
+- **`--build-artifacts` skips nested repositories.** A submodule or vendored checkout has its own `.git` and marker file, so its `target/` or `build/` qualified. A `.git` in any directory between the project and `--path` now disqualifies it.
+
+- **`parse_duration` rejects overflow, signs and multibyte units.** `18446744073709551615w` wrapped to a small age in release builds, widening what `-o` removes. `+5d` was accepted, and `5` followed by a multibyte character panicked.
 
 - **Default excludes restored to `**/.venv` and `**/venv`.** 0.4.2 emptied `DEFAULT_EXCLUDES` without touching the README or the two tests that assert a virtualenv is pruned, so the suite was red and a default run scanned and deleted inside local virtualenvs. The 0.4.2 note below no longer describes the shipped behaviour.
 
-- **Config-file mode applies `--path`, `--glob`, `--preset` and `--format json`.** `-c` dispatched to a helper that read only a subset of the flags, so `rclean -c --path other-dir` cleaned the directory named in the config file instead of the one named on the command line -- the wrong scope for a deletion tool, reported as success. Pattern resolution and job reporting are now shared with non-config mode, `--list` answers before any config is loaded, and `-w` / `--write-configfile` conflicts with `-c` rather than being silently dropped. `--path` now defaults to `.` at the point of use instead of in the parser, which is how config mode tells an explicit path from an unset one.
+- **Config-file mode applies `--path`, `--glob`, `--preset` and `--format json`.** `-c` dispatched to a helper that read only a subset of the flags, so `reclean -c --path other-dir` cleaned the directory named in the config file instead of the one named on the command line -- the wrong scope for a deletion tool, reported as success. Pattern resolution and job reporting are now shared with non-config mode, `--list` answers before any config is loaded, and `-w` / `--write-configfile` conflicts with `-c` rather than being silently dropped. `--path` now defaults to `.` at the point of use instead of in the parser, which is how config mode tells an explicit path from an unset one.
 
 - **Traversal skips a directory whose path will not canonicalize.** The containment check read a `canonicalize()` error as proof the directory was inside the working directory, so a permission failure, or a directory replaced by a symlink mid-walk, let the scan descend and match outside the root. Such a directory is now skipped with a warning.
 

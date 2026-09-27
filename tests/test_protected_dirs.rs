@@ -1,5 +1,5 @@
-use rclean::constants::PROTECTED_DIRS;
-use rclean::{CleanConfig, CleaningJob};
+use reclean::constants::PROTECTED_DIRS;
+use reclean::{CleanConfig, CleaningJob};
 use std::fs;
 use tempfile::TempDir;
 
@@ -164,7 +164,7 @@ fn test_protection_exempts_an_explicitly_named_root() {
 
 #[test]
 fn test_config_without_protected_dirs_field_gets_defaults() {
-    // A .rclean.toml written before protection existed must still be protected
+    // A .reclean.toml written before protection existed must still be protected
     let toml = r#"
 path = "."
 patterns = ["**/*.pyc"]

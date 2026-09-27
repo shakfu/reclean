@@ -75,9 +75,9 @@ def main():
         demo = Path('demo')
     demo.mkdir()
     create_detritus(demo)
-    rclean = Path("target/debug/rclean")
-    assert rclean.exists()
-    subprocess.call(["../target/debug/rclean"], cwd=demo)
+    reclean = Path("target/debug/reclean")
+    assert reclean.exists()
+    subprocess.call(["../target/debug/reclean"], cwd=demo)
 
 if __name__ == '__main__':
     main()

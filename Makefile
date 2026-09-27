@@ -27,12 +27,12 @@ clean:
 	@rm -rf target
 
 install: build
-	@cp target/release/rclean /usr/local/bin/
-	@echo "rclean installed"
+	@cp target/release/reclean /usr/local/bin/
+	@echo "reclean installed"
 
 uninstall:
-	@rm -f /usr/local/bin/rclean
-	@echo "rclean uninstalled"
+	@rm -f /usr/local/bin/reclean
+	@echo "reclean uninstalled"
 
 publish-dry:
 	@cargo publish --dry-run

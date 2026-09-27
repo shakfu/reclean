@@ -1,4 +1,6 @@
-# rclean
+# reclean
+
+`reclean` is short for "recursive clean".
 
 A fast, safe Rust command-line utility for recursively removing files and directories matching glob patterns. Designed for cleaning development artifacts with multiple safety measures and performance optimizations.
 
@@ -6,7 +8,7 @@ A fast, safe Rust command-line utility for recursively removing files and direct
 
 - **Pattern Matching**: Include and exclude glob patterns with full wildcard support
 
-- **Presets**: Named pattern groups for Python, Node.js, Rust, Java, C, Go, and more
+- **Dependencies**: Optional removal of `node_modules`, `.venv` and `vendor`, matched only beside their lock file
 
 - **Build artifacts**: Optional removal of build output, matched by project layout rather than by name
 
@@ -16,7 +18,7 @@ A fast, safe Rust command-line utility for recursively removing files and direct
 
 - **Statistics**: Optional breakdown of deletions by pattern with size reporting
 
-- **Configuration**: `.rclean.toml` with automatic discovery (upward search + global fallback)
+- **Configuration**: `.reclean.toml` with automatic discovery (upward search + global fallback)
 
 - **JSON Output**: Machine-readable output for scripting and automation
 
@@ -28,7 +30,7 @@ A fast, safe Rust command-line utility for recursively removing files and direct
 
 ```sh
 # Install from crates.io
-cargo install rclean
+cargo install reclean
 
 # Or build and install to /usr/local/bin
 make install
@@ -40,26 +42,27 @@ cargo build --release
 ## Usage
 
 ```sh
-% rclean --help
+% reclean --help
 Safely remove files and directories matching a set of glob patterns.
 
-Usage: rclean [OPTIONS]
+Usage: reclean [OPTIONS]
 
 Options:
   -p, --path <PATH>               Working directory [default: .]
   -g, --glob <GLOB>               Include glob pattern(s) (can specify multiple)
   -e, --exclude <EXCLUDE>         Exclude glob pattern(s) (can specify multiple)
-      --preset <PRESET>           Use a named preset (common, python, node, rust, java, c, go, all)
-  -c, --configfile [PATH]         Load config (searches upward, then ~/.config/rclean/)
-  -w, --write-configfile          Write default '.rclean.toml' file
+  -c, --configfile [PATH]         Load config (searches upward, then ~/.config/reclean/)
+  -w, --write-configfile          Write default '.reclean.toml' file
   -d, --dry-run                   Preview deletions without removing
   -y, --skip-confirmation         Skip confirmation prompt
   -s, --stats                     Display statistics by pattern
   -o, --older-than <DURATION>     Only remove files older than duration (e.g., "30d", "7d", "24h")
+      --larger-than <SIZE>        Only remove targets of at least this size (e.g., "100M", "1.5G")
   -P, --progress                  Show progress bar during scanning
   -i, --include-symlinks          Include matched symlinks for removal
   -r, --remove-broken-symlinks    Remove broken symlinks
   -B, --build-artifacts           Also match build output at the top level of a project
+  -D, --dependencies              Also match dependency trees beside their lock file
   -v, --verbose                   Increase verbosity (debug-level logging)
   -q, --quiet                     Suppress all output except errors
   -l, --list                      List default glob patterns
@@ -74,90 +77,72 @@ Options:
 
 ```bash
 # Preview what would be deleted (dry-run)
-rclean -d
+reclean -d
 
 # Remove with default patterns (requires confirmation)
-rclean
+reclean
 
 # Custom patterns with multiple includes
-rclean -g "*.log" -g "**/*.tmp"
+reclean -g "*.log" -g "**/*.tmp"
 
 # Also remove build output: ./target beside Cargo.toml, ./build beside CMakeLists.txt
-rclean -d -B
+reclean -d -B
 
 # Exclude specific patterns
-rclean -g "*.cache" -e "**/important.cache"
+reclean -g "*.cache" -e "**/important.cache"
 
-# Use presets for specific ecosystems
-rclean --preset node
-rclean --preset rust
-rclean --preset python --preset common
+# Also remove dependency trees: ./node_modules beside package-lock.json, ...
+reclean -d -D
 
-# Combine presets with custom patterns
-rclean --preset python -g "**/*.log"
-
-# List available presets and their patterns
-rclean -l --preset python
+# Only remove targets of 100 MiB or more
+reclean -d -B -D --larger-than 100M
 
 # Show statistics breakdown
-rclean -s
+reclean -s
 
 # Only remove files older than 30 days
-rclean -o 30d
+reclean -o 30d
 
 # Remove broken symlinks
-rclean -b
+reclean -r
 
 # Skip confirmation (use with caution)
-rclean -y
+reclean -y
 
-# Use config file (auto-discovers .rclean.toml upward or ~/.config/rclean/)
-rclean -c
+# Use config file (auto-discovers .reclean.toml upward or ~/.config/reclean/)
+reclean -c
 
 # Use config file with CLI overrides
-rclean -c --dry-run --stats
+reclean -c --dry-run --stats
 
 # Use explicit config file path
-rclean -c configs/my-cleanup.toml
+reclean -c configs/my-cleanup.toml
 
 # JSON output for scripting
-rclean -d --format json | jq '.summary'
+reclean -d --format json | jq '.summary'
 
 # Quiet mode for scripting
-rclean -y -q
+reclean -y -q
 ```
 
-## Presets
+## Default Patterns
 
-Named pattern groups for common ecosystems. Use `--preset` to select one or more:
+With no `--glob`, reclean matches caches, OS debris and shell history: `__pycache__`, `*.pyc`, `*.pyo`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.coverage`, `.DS_Store`, `Thumbs.db`, `.bash_history`, and a few more. `reclean -l` prints the full list. `--glob` replaces it.
 
-| Preset   | Targets |
-|----------|---------|
-| `common` | `.DS_Store`, `Thumbs.db`, `*.swp`, `*~`, history files |
-| `python` | `__pycache__`, `*.pyc`, `.coverage`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, etc. |
-| `node`   | `node_modules`, `.next`, `.nuxt`, `.cache`, `.parcel-cache`, `coverage`, etc. |
-| `rust`   | `target` |
-| `java`   | `*.class`, `target`, `.gradle`, `build`, `.settings`, etc. |
-| `c`      | `*.o`, `*.obj`, `*.a`, `*.lib`, `*.so`, `*.dylib`, `*.dll` |
-| `go`     | `vendor` |
-| `all`    | All of the above combined (deduplicated) |
-
-Default patterns (no `--preset` or `--glob`): `common` + `python` combined.
-
-View any preset's patterns with `rclean -l --preset <name>`.
+Build output and dependency trees are not patterns. Their names (`build`, `target`, `vendor`, `node_modules`) are too ordinary to match safely by name alone, so they are matched by project layout under `-B` and `-D`. A name-only match remains available as a glob: `reclean -g "**/node_modules"`.
 
 ## Configuration
 
 ### Config File
 
-Create a `.rclean.toml` file to persist your settings:
+Create a `.reclean.toml` file to persist your settings:
 
 ```bash
 # Generate default config
-rclean -w
+reclean -w
 ```
 
-Example `.rclean.toml`:
+Example `.reclean.toml`:
 
 ```toml
 path = "."
@@ -179,6 +164,9 @@ include_symlinks = false
 remove_broken_symlinks = false
 stats_mode = true
 build_artifacts = false
+dependencies = false
+# Optional. Only remove targets of at least this many bytes.
+# larger_than_bytes = 104857600
 
 # Optional. Omit to keep the built-in list; set to [] to disable protection.
 protected_dirs = [".git", ".hg", ".svn", ".config", ".ssh", ".gnupg"]
@@ -186,15 +174,17 @@ protected_dirs = [".git", ".hg", ".svn", ".config", ".ssh", ".gnupg"]
 
 ### Config Discovery
 
-When you run `rclean -c` (without a path), the tool searches for configuration in this order:
+When you run `reclean -c` (without a path), the tool searches for configuration in this order:
 
-1. `.rclean.toml` in the current directory, then each parent directory upward
+1. `.reclean.toml` in the current directory, then each parent directory upward
 
-2. `~/.config/rclean/config.toml` (global config)
+2. `~/.config/reclean/config.toml` (global config)
 
-You can also specify an explicit path: `rclean -c path/to/config.toml`.
+You can also specify an explicit path: `reclean -c path/to/config.toml`.
 
-CLI flags always override config file values (e.g., `rclean -c --dry-run` forces dry-run even if the config says `dry_run = false`).
+CLI flags always override config file values (e.g., `reclean -c --dry-run` forces dry-run even if the config says `dry_run = false`).
+
+Unknown keys are an error, so a misspelt `dry_run` stops the run instead of being ignored.
 
 ### Shell Completions
 
@@ -202,13 +192,13 @@ Generate shell completions for your shell:
 
 ```bash
 # Bash
-rclean --completions bash > ~/.bash_completions/rclean
+reclean --completions bash > ~/.bash_completions/reclean
 
 # Zsh
-rclean --completions zsh > ~/.zfunc/_rclean
+reclean --completions zsh > ~/.zfunc/_reclean
 
 # Fish
-rclean --completions fish > ~/.config/fish/completions/rclean.fish
+reclean --completions fish > ~/.config/fish/completions/reclean.fish
 ```
 
 ### JSON Output
@@ -216,18 +206,22 @@ rclean --completions fish > ~/.config/fish/completions/rclean.fish
 Use `--format json` for machine-readable output:
 
 ```bash
-rclean -d --format json | jq '.summary'
+reclean -d --format json | jq '.summary'
 ```
 
-The JSON output includes four sections:
+The document opens with `"schema": 1`, which changes when a field changes meaning or is removed, and `config`, the config file used or `null`. It then includes:
 
-- `matches` - Array of matched items with path, size, and pattern
+- `matches` - Array of matched items with `path`, `size`, `pattern`, `reason`, `type` (`directory`, `file` or `symlink`), and `restore` for a dependency tree
 
 - `summary` - Total count, size (bytes and human-readable), dry-run flag
 
 - `stats` - Per-pattern breakdown (count, size) when `--stats` is enabled
 
+- `reasons` - Per-reason breakdown (count, size), cheapest to restore first: `pattern`, `broken-symlink`, `build-artifact`, `dependency`
+
 - `failures` - Array of failed deletions with path and error message
+
+- `warnings` - Array of paths that could not be read, with the error message
 
 ## Build Artifacts
 
@@ -258,7 +252,57 @@ project/
 
 A matched directory is one deletion target and is not entered, so its contents are neither walked nor counted. Protected directories and excludes are applied first: build output inside `.venv` stays.
 
+The project must also be the outermost one below `--path`. A submodule or vendored checkout carries its own `.git` and marker, so if any directory between it and `--path` holds a `.git`, its build output is skipped. Name the nested project on `--path` to clean it directly.
+
 Matches are attributed to the pattern `build-artifact` in `--stats` and `--format json`.
+
+## Dependencies
+
+`-D` / `--dependencies` matches a dependency tree when the lock file that pins it sits beside it. The restore command is printed beside each match and carried as `restore` in JSON output.
+
+| Directory | Lock file beside it | Restored by |
+|-|-|-|
+| `.venv` | `uv.lock` | `uv sync` |
+| `node_modules` | `package-lock.json`, `npm-shrinkwrap.json` | `npm ci` |
+| `node_modules` | `yarn.lock` | `yarn install --immutable` |
+| `node_modules` | `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| `node_modules` | `bun.lock`, `bun.lockb` | `bun install --frozen-lockfile` |
+| `vendor` | `go.mod` | `go mod vendor` |
+
+The marker is the lock, not the manifest: `package.json` and `pyproject.toml` carry version ranges, so only the lock names the tree the command puts back. A tree with no lock beside it is left alone. A lock reached through a symlink does not count.
+
+The built-in `.venv` exclude does not apply here: it exists to skip scanning a virtualenv, and `-D` with a `uv.lock` asks for it whole. Excludes from `--exclude` or a config file still apply.
+
+Two things are not preserved. Edits made inside a dependency tree are lost; patched `vendor/` source is the usual case. For Go, removing `vendor/` makes the build use the module cache or the network.
+
+## Size Filter
+
+`--larger-than` keeps only targets of at least the given size. A directory is judged by the total size of its contents. Sizes are bytes by default, or binary `K`, `M`, `G`, `T` (also `KiB` ... `TiB`). A fractional value is converted exactly and truncated toward zero; signs, exponents and lowercase suffixes are errors.
+
+## Output and Confirmation
+
+Each match is listed with its size, followed by a total. A run with more than one reason also prints a breakdown by reason.
+
+The prompt takes a single keypress. `y` proceeds; anything else cancels. Keys typed before the prompt appears are discarded. When stdin is not a terminal, one character is read from it instead, so `echo y | reclean` works; end of input cancels.
+
+Targets are removed in parallel. Results are reported in list order.
+
+## Age Filter
+
+`--older-than` keeps a target only when it is older than the duration. For a directory, the newest entry anywhere inside it sets its age, so an old `__pycache__` holding one new file is kept. Symlinks are aged by the link's own timestamp.
+
+A target is also kept when its age cannot be shown: a timestamp in the future, a timestamp that cannot be read, or a subdirectory that cannot be listed.
+
+## Exit Codes
+
+| Code | Meaning |
+|-|-|
+| 0 | Success, nothing matched, cancelled, or dry run |
+| 1 | `--path` cannot be read, a removal failed, or confirmation could not be read |
+| 2 | Bad option or invalid configuration |
+| 3 | The run completed, but part of the tree could not be read |
+
+Status 3 is reported as a warning per path, and under `warnings` in JSON output. Matches beneath an unreadable directory are not considered.
 
 ## Safety Measures
 
@@ -274,7 +318,7 @@ They hold data whose loss is expensive and unrecoverable, and their contents als
 
 Two deliberate exceptions:
 
-- A directory named on `--path` is entered. Pointing rclean at `.git` is a deliberate act, and silently doing nothing there would be its own trap.
+- A directory named on `--path` is entered. Pointing reclean at `.git` is a deliberate act, and silently doing nothing there would be its own trap.
 
 - `--no-protect` disables the list for one run. In a config file, `protected_dirs` replaces it outright, so a project can protect names of its own.
 
@@ -314,6 +358,8 @@ This is an ordinary exclude, not protection. Three ways to clean a virtualenv an
 
 - Symlinks only removed with explicit `--include-symlinks` flag
 
+- Each target is re-checked just before removal. It must still resolve inside the working directory and be the same file (device and inode on Unix) the scan found. The window between the check and the removal is narrowed, not closed: removal resolves the path again.
+
 - Broken symlinks only removed with `--remove-broken-symlinks` flag
 
 ## Development
@@ -345,7 +391,7 @@ Comprehensive test suite with 69 tests:
 
 - 10 duration parsing tests (all units, edge cases)
 
-- 9 preset resolution tests (all presets, deduplication, unknown handling)
+- 4 default pattern and dependency table tests
 
 - 9 glob matching and TOML serialization tests
 

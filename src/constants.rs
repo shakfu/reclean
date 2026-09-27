@@ -1,7 +1,7 @@
 // --------------------------------------------------------------------
 // constants
 
-pub const SETTINGS_FILENAME: &str = ".rclean.toml";
+pub const SETTINGS_FILENAME: &str = ".reclean.toml";
 
 /// Directories never matched and never entered.
 ///
@@ -87,97 +87,61 @@ pub fn get_artifact_dirs() -> Vec<String> {
     names
 }
 
-/// Available preset names
-pub const PRESET_NAMES: &[&str] = &["common", "python", "node", "rust", "java", "c", "go", "all"];
+/// Glob patterns matched when none are given.
+///
+/// Caches and editor debris only: each is regenerated without the network.
+/// Build output and dependency trees have ordinary names, so they are matched by
+/// project layout instead, under `--build-artifacts` and `--dependencies`.
+pub const DEFAULT_PATTERNS: &[&str] = &[
+    "**/.DS_Store",
+    "**/.bash_history",
+    "**/.python_history",
+    "**/Thumbs.db",
+    "**/__pycache__",
+    "**/.coverage",
+    "**/.mypy_cache",
+    "**/.pylint_cache",
+    "**/.pytest_cache",
+    "**/.ruff_cache",
+    "**/.rumdl_cache",
+    "**/.pyscn",
+    "**/.ropeproject",
+    "**/pip-log.txt",
+    "**/*.pyc",
+    "**/*.pyo",
+];
 
-/// Get patterns for a named preset
-pub fn get_preset_patterns(name: &str) -> Option<Vec<String>> {
-    let patterns: Vec<&str> = match name {
-        "common" => vec![
-            "**/.DS_Store",
-            "**/.bash_history",
-            "**/.python_history",
-            "**/Thumbs.db",
-            "**/*.swp",
-            "**/*.swo",
-            // "**/*~",
-        ],
-        "python" => vec![
-            "**/__pycache__",
-            "**/.coverage",
-            "**/.mypy_cache",
-            "**/.pylint_cache",
-            "**/.pytest_cache",
-            "**/.ruff_cache",
-            "**/.rumdl_cache",
-            "**/.pyscn",
-            "**/.ropeproject",
-            "**/.python_history",
-            "**/pip-log.txt",
-            "**/*.pyc",
-            "**/*.pyo",
-            // "**/*.egg-info",
-            // "**/dist",
-        ],
-        "node" => vec![
-            "**/node_modules",
-            "**/.next",
-            "**/.nuxt",
-            "**/.cache",
-            "**/dist",
-            "**/.parcel-cache",
-            "**/.turbo",
-            "**/.eslintcache",
-            "**/coverage",
-            "**/.nyc_output",
-        ],
-        "rust" => vec!["**/target"],
-        "java" => vec![
-            "**/*.class",
-            "**/target",
-            "**/.gradle",
-            "**/build",
-            "**/.settings",
-            "**/.classpath",
-            "**/.project",
-        ],
-        "c" => vec![
-            "**/*.o",
-            "**/*.obj",
-            "**/*.a",
-            "**/*.lib",
-            "**/*.so",
-            "**/*.dylib",
-            "**/*.dll",
-        ],
-        "go" => vec!["**/vendor"],
-        "all" => {
-            let mut all = Vec::new();
-            for preset in &["common", "python", "node", "rust", "java", "c", "go"] {
-                if let Some(p) = get_preset_patterns(preset) {
-                    for pattern in p {
-                        if !all.contains(&pattern) {
-                            all.push(pattern);
-                        }
-                    }
-                }
-            }
-            return Some(all);
-        }
-        _ => return None,
-    };
-
-    Some(patterns.into_iter().map(String::from).collect())
+/// The default patterns, owned.
+pub fn get_default_patterns() -> Vec<String> {
+    DEFAULT_PATTERNS.iter().map(|s| s.to_string()).collect()
 }
 
-/// Get the default patterns (python + common for backwards compatibility)
-pub fn get_default_patterns() -> Vec<String> {
-    let mut patterns = get_preset_patterns("common").unwrap_or_default();
-    patterns.extend(get_preset_patterns("python").unwrap_or_default());
+/// Dependency trees that `--dependencies` may remove: the directory, the lock
+/// file that must sit beside it, and the command that restores it.
+///
+/// The marker is the file that pins versions, not the one that declares them:
+/// only a lock names the exact tree the restore command puts back. A directory
+/// with no lock beside it is left alone.
+pub const DEPENDENCIES: &[(&str, &str, &str)] = &[
+    (".venv", "uv.lock", "uv sync"),
+    ("node_modules", "package-lock.json", "npm ci"),
+    ("node_modules", "npm-shrinkwrap.json", "npm ci"),
+    ("node_modules", "yarn.lock", "yarn install --immutable"),
+    (
+        "node_modules",
+        "pnpm-lock.yaml",
+        "pnpm install --frozen-lockfile",
+    ),
+    // bun wrote the binary `bun.lockb` before 1.2, and `bun.lock` since
+    ("node_modules", "bun.lock", "bun install --frozen-lockfile"),
+    ("node_modules", "bun.lockb", "bun install --frozen-lockfile"),
+    ("vendor", "go.mod", "go mod vendor"),
+];
 
-    // Deduplicate while preserving order
-    let mut seen = std::collections::HashSet::new();
-    patterns.retain(|p| seen.insert(p.clone()));
-
-    patterns
+/// The distinct dependency directory names, sorted.
+pub fn get_dependency_dirs() -> Vec<String> {
+    let mut names: Vec<String> = DEPENDENCIES.iter().map(|(d, _, _)| d.to_string()).collect();
+    names.sort();
+    names.dedup();
+    names
 }
