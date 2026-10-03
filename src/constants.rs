@@ -94,8 +94,6 @@ pub fn get_artifact_dirs() -> Vec<String> {
 /// project layout instead, under `--build-artifacts` and `--dependencies`.
 pub const DEFAULT_PATTERNS: &[&str] = &[
     "**/.DS_Store",
-    "**/.bash_history",
-    "**/.python_history",
     "**/Thumbs.db",
     "**/__pycache__",
     "**/.coverage",

@@ -22,6 +22,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+### Added
+
+- CI runs `cargo fmt --check`, clippy with warnings denied, and `cargo test` on Linux and macOS.
+
+### Changed
+
+- Every config file key is optional. Before, a file missing `path`, `patterns`, `dry_run`, `skip_confirmation`, `include_symlinks` or `remove_broken_symlinks` failed with `missing field`. A missing key now takes its default; a missing `patterns` means the built-in patterns, as without `--glob`. `patterns = []` still matches nothing, and unknown keys are still an error.
+
+- The defaults no longer include `.bash_history` or `.python_history`. Shell and REPL history is user data that nothing regenerates, which the default list's own rule excludes. Remove it with `-g '**/.bash_history'` if wanted.
+
+### Fixed
+
+- On macOS the global config was read from `~/Library/Application Support/reclean/config.toml`, the platform default of `dirs::config_dir()`, not the documented `~/.config/reclean/config.toml`. macOS now reads `$XDG_CONFIG_HOME/reclean/config.toml` when that is absolute, else `~/.config/reclean/config.toml`, as Linux always did. The 0.5.0 location is still read as a fallback, with a warning naming the new one. Windows keeps `%APPDATA%`. The "no config found" error lists every location searched.
+
 ## [0.5.0]
 
 ### Changed

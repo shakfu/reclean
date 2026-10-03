@@ -127,7 +127,7 @@ reclean -y -q
 
 ## Default Patterns
 
-With no `--glob`, reclean matches caches, OS debris and shell history: `__pycache__`, `*.pyc`, `*.pyo`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.coverage`, `.DS_Store`, `Thumbs.db`, `.bash_history`, and a few more. `reclean -l` prints the full list. `--glob` replaces it.
+With no `--glob`, reclean matches caches and OS debris: `__pycache__`, `*.pyc`, `*.pyo`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.coverage`, `.DS_Store`, `Thumbs.db`, and a few more. Shell and REPL history (`.bash_history`, `.python_history`) is user data and is left alone; name it with `-g` to remove it. `reclean -l` prints the full list. `--glob` replaces it.
 
 Build output and dependency trees are not patterns. Their names (`build`, `target`, `vendor`, `node_modules`) are too ordinary to match safely by name alone, so they are matched by project layout under `-B` and `-D`. A name-only match remains available as a glob: `reclean -g "**/node_modules"`.
 
@@ -142,6 +142,8 @@ Create a `.reclean.toml` file to persist your settings:
 reclean -w
 ```
 
+Every key is optional. A missing key takes its default: `path = "."`, every flag `false`, no age or size filter, and the built-in pattern, exclude and protected lists. `patterns = []` matches nothing: to match only build output or dependency trees, set it alongside `build_artifacts` or `dependencies`, since omitting `patterns` adds the built-in list.
+
 Example `.reclean.toml`:
 
 ```toml
@@ -151,7 +153,7 @@ patterns = [
     "**/*.pyc",
     "**/.DS_Store"
 ]
-# Optional. Omit to keep the built-in list; set to [] to exclude nothing.
+# Omit to keep the built-in list; set to [] to exclude nothing.
 exclude_patterns = [
     "**/.venv",
     "**/venv",
@@ -165,10 +167,10 @@ remove_broken_symlinks = false
 stats_mode = true
 build_artifacts = false
 dependencies = false
-# Optional. Only remove targets of at least this many bytes.
+# Only remove targets of at least this many bytes.
 # larger_than_bytes = 104857600
 
-# Optional. Omit to keep the built-in list; set to [] to disable protection.
+# Omit to keep the built-in list; set to [] to disable protection.
 protected_dirs = [".git", ".hg", ".svn", ".config", ".ssh", ".gnupg"]
 ```
 
@@ -178,7 +180,13 @@ When you run `reclean -c` (without a path), the tool searches for configuration 
 
 1. `.reclean.toml` in the current directory, then each parent directory upward
 
-2. `~/.config/reclean/config.toml` (global config)
+2. The global config:
+
+   - Linux and macOS: `$XDG_CONFIG_HOME/reclean/config.toml` when `XDG_CONFIG_HOME` is an absolute path, else `~/.config/reclean/config.toml`.
+
+   - macOS, if neither exists: `~/Library/Application Support/reclean/config.toml`, where 0.5.0 read it. reclean warns and names the preferred location.
+
+   - Windows: `%APPDATA%\reclean\config.toml`.
 
 You can also specify an explicit path: `reclean -c path/to/config.toml`.
 

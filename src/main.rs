@@ -198,8 +198,9 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<i
         })?;
         discover_config(&cwd).ok_or_else(|| {
             reclean::CleanError::ConfigError(format!(
-                "No '{}' found in directory tree or global config (~/.config/reclean/config.toml)",
-                SETTINGS_FILENAME
+                "No '{}' found in directory tree or global config ({:?})",
+                SETTINGS_FILENAME,
+                reclean::global_config_locations()
             ))
         })?
     };

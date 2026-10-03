@@ -8,6 +8,17 @@ fn test_default_patterns_cover_python_caches() {
 }
 
 #[test]
+fn test_default_patterns_leave_history_alone() {
+    // Shell and REPL history is user data that nothing regenerates
+    let defaults = get_default_patterns();
+    assert!(
+        !defaults.iter().any(|p| p.contains("history")),
+        "history pattern in defaults: {:?}",
+        defaults
+    );
+}
+
+#[test]
 fn test_default_patterns_no_duplicates() {
     let defaults = get_default_patterns();
     let mut seen = std::collections::HashSet::new();

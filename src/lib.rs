@@ -245,12 +245,55 @@ pub fn find_config_upward(start_dir: &Path, filename: &str) -> Option<PathBuf> {
     }
 }
 
-/// Return the path to the global config file, if it exists.
-/// Checks `~/.config/reclean/config.toml`.
+/// Return the path to the global config file, if it exists: the first of
+/// [`global_config_locations`] that is a file.
 pub fn global_config_path() -> Option<PathBuf> {
-    dirs::config_dir()
-        .map(|d| d.join("reclean").join("config.toml"))
-        .filter(|p| p.is_file())
+    let locations = global_config_locations();
+    let found = locations.iter().position(|p| p.is_file())?;
+    if found > 0 {
+        warn!(
+            "reading {:?}, the 0.5.0 location; move it to {:?}",
+            locations[found], locations[0]
+        );
+    }
+    Some(locations[found].clone())
+}
+
+/// Where the global config file is looked for, in order. Linux and macOS use
+/// `$XDG_CONFIG_HOME/reclean/config.toml`, else `~/.config/reclean/config.toml`,
+/// where command-line users look. Windows uses `%APPDATA%\reclean\config.toml`.
+/// macOS also reads `~/Library/Application Support/reclean/config.toml`, where
+/// 0.5.0 read it.
+pub fn global_config_locations() -> Vec<PathBuf> {
+    config_dirs(
+        std::env::consts::OS,
+        std::env::var_os("XDG_CONFIG_HOME"),
+        dirs::home_dir(),
+        dirs::config_dir(),
+    )
+    .into_iter()
+    .map(|d| d.join("reclean").join("config.toml"))
+    .collect()
+}
+
+/// Config base directories for `os`, in search order. `platform` is the
+/// platform's own config directory, as `dirs::config_dir()` reports it.
+fn config_dirs(
+    os: &str,
+    xdg: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+    platform: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    // The XDG spec says a relative XDG_CONFIG_HOME is invalid and ignored.
+    let xdg_dir = xdg
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(".config")));
+    match os {
+        "windows" => platform.into_iter().collect(),
+        "macos" => xdg_dir.into_iter().chain(platform).collect(),
+        _ => xdg_dir.into_iter().collect(),
+    }
 }
 
 /// Discover a config file: first search upward for `.reclean.toml`, then fall back to global.
@@ -264,16 +307,20 @@ pub fn discover_config(start_dir: &Path) -> Option<PathBuf> {
 /// Serializable configuration for a cleaning job.
 ///
 /// Construct via [`CleanConfig::builder()`] or deserialize from a `.reclean.toml` file.
+/// Every key in the file is optional; a missing key takes its value from
+/// [`CleanConfig::default()`], except `patterns`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct CleanConfig {
     /// Root directory to clean (default `"."`).
     pub path: String,
-    /// Glob patterns to match for deletion.
+    /// Glob patterns to match for deletion. Empty in [`CleanConfig::default()`];
+    /// a file that omits the key gets [`constants::DEFAULT_PATTERNS`], as the
+    /// command line does without `--glob`. `patterns = []` matches nothing.
+    #[serde(default = "constants::get_default_patterns")]
     pub patterns: Vec<String>,
     /// Glob patterns to exclude. An excluded directory is not entered.
     /// Defaults to [`constants::DEFAULT_EXCLUDES`]; an empty list excludes nothing.
-    #[serde(default = "constants::get_default_excludes")]
     pub exclude_patterns: Vec<String>,
     /// When `true`, report matches without deleting anything.
     pub dry_run: bool,
@@ -284,31 +331,24 @@ pub struct CleanConfig {
     /// When `true`, broken symlinks are removed regardless of pattern matching.
     pub remove_broken_symlinks: bool,
     /// When `true`, display per-pattern match counts and sizes.
-    #[serde(default)]
     pub stats_mode: bool,
     /// If set, only remove files whose last modification is older than this many seconds.
-    #[serde(default)]
     pub older_than_secs: Option<u64>,
     /// When `true`, show a progress spinner during scanning.
-    #[serde(default)]
     pub show_progress: bool,
     /// When `true`, produce JSON output instead of human-readable text. CLI-only, not serialized.
     #[serde(skip)]
     pub json_mode: bool,
     /// Directory names that are never matched and never entered. Defaults to
     /// [`constants::PROTECTED_DIRS`]; an empty list disables the protection.
-    #[serde(default = "constants::get_protected_dirs")]
     pub protected_dirs: Vec<String>,
     /// When `true`, match build output at the top level of a project as well.
     /// See [`constants::BUILD_ARTIFACTS`].
-    #[serde(default)]
     pub build_artifacts: bool,
     /// When `true`, match dependency trees beside their lock file as well.
     /// See [`constants::DEPENDENCIES`].
-    #[serde(default)]
     pub dependencies: bool,
     /// If set, only remove targets of at least this many bytes.
-    #[serde(default)]
     pub larger_than_bytes: Option<u64>,
     /// The configuration file this was read from, reported in JSON output.
     /// CLI-only, not serialized.
@@ -1566,6 +1606,43 @@ fn confirm(prompt: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_dirs_follow_the_platform() {
+        let home = || Some(PathBuf::from("/home/u"));
+        let support = || Some(PathBuf::from("/home/u/Library/Application Support"));
+        let appdata = || Some(PathBuf::from("C:\\Users\\u\\AppData\\Roaming"));
+        let p = PathBuf::from;
+
+        assert_eq!(
+            config_dirs("linux", None, home(), home()),
+            vec![p("/home/u/.config")]
+        );
+        assert_eq!(
+            config_dirs("linux", Some("/xdg".into()), home(), home()),
+            vec![p("/xdg")]
+        );
+        // A relative XDG_CONFIG_HOME is ignored
+        assert_eq!(
+            config_dirs("linux", Some("relative".into()), home(), home()),
+            vec![p("/home/u/.config")]
+        );
+        assert_eq!(
+            config_dirs("macos", None, home(), support()),
+            vec![
+                p("/home/u/.config"),
+                p("/home/u/Library/Application Support")
+            ]
+        );
+        assert_eq!(
+            config_dirs("windows", Some("/xdg".into()), home(), appdata()),
+            vec![p("C:\\Users\\u\\AppData\\Roaming")]
+        );
+        assert_eq!(
+            config_dirs("linux", None, None, None),
+            Vec::<PathBuf>::new()
+        );
+    }
 
     #[test]
     fn replaced_file_is_not_removed() {
