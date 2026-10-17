@@ -727,22 +727,9 @@ fn same_object(scanned: &Metadata, current: &Metadata) -> bool {
     scanned.file_type() == current.file_type()
 }
 
-/// Skip the current and parent directory references, and anything reached
-/// through `..`.
+/// Skip the current and parent directory references.
 fn should_process(entry_path: &Path) -> bool {
-    let current_path = Path::new(".");
-    let parent_path = Path::new("..");
-
-    if entry_path == current_path || entry_path == parent_path {
-        return false;
-    }
-
-    if entry_path.starts_with("..") {
-        warn!("skipping {:?}", entry_path.display());
-        return false;
-    }
-
-    true
+    entry_path != Path::new(".") && entry_path != Path::new("..")
 }
 
 /// Whether `path` is build output at the top level of a project.
@@ -1328,7 +1315,14 @@ impl CleaningJob {
             })?
             .file_type();
 
-        if scan.consider(path, None, root_type) {
+        // A symlinked root is walked as its target, which `base_path` already
+        // resolves to. The link itself is never a target.
+        let walk = if root_type.is_symlink() {
+            fs::metadata(path).is_ok_and(|m| m.is_dir())
+        } else {
+            scan.consider(path, None, root_type)
+        };
+        if walk {
             parallel_dir_queue(vec![path.to_path_buf()], |dir| scan.visit_dir(dir));
         }
 
