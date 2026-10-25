@@ -5,7 +5,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::{generate, Shell};
 use log::{error, info};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process;
 
@@ -22,19 +22,19 @@ use reclean::{discover_config, parse_duration, parse_size, CleanConfig, Cleaning
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Working Directory [default: .]
+    /// Working directory [default: .]
     #[arg(short, long)]
     path: Option<String>,
 
-    /// Specify custom glob pattern(s)
+    /// Include glob pattern(s), matched below the working directory
     #[arg(short, long)]
     glob: Option<Vec<String>>,
 
-    /// Exclude patterns (files matching these will not be deleted)
+    /// Exclude glob pattern(s); an excluded directory is not entered
     #[arg(short, long)]
     exclude: Option<Vec<String>>,
 
-    /// Configure from config file (searches upward then ~/.config/reclean/ if no path given)
+    /// Load config (searches upward, then ~/.config/reclean/)
     #[arg(short, long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
     configfile: Option<String>,
 
@@ -42,11 +42,11 @@ struct Args {
     #[arg(short, long, conflicts_with = "configfile")]
     write_configfile: bool,
 
-    /// Dry-run without actual removal
+    /// Preview deletions without removing
     #[arg(short, long)]
     dry_run: bool,
 
-    /// Skip confirmation
+    /// Skip confirmation prompt
     #[arg(short = 'y', long)]
     skip_confirmation: bool,
 
@@ -70,8 +70,8 @@ struct Args {
     #[arg(short = 's', long)]
     stats: bool,
 
-    /// Only remove files older than specified duration (e.g., "30d", "7d", "24h", "3600s")
-    #[arg(short = 'o', long)]
+    /// Only remove targets older than this duration (e.g., "30d", "7d", "24h")
+    #[arg(short = 'o', long, value_name = "DURATION")]
     older_than: Option<String>,
 
     /// Only remove targets of at least this size (e.g., "100M", "1.5G", "4096")
@@ -102,7 +102,7 @@ struct Args {
     #[arg(long, default_value = "text")]
     format: OutputFormat,
 
-    /// list default glob patterns
+    /// List default patterns, excludes, protected, artifact and dependency names
     #[arg(short, long)]
     list: bool,
 }
@@ -116,20 +116,50 @@ enum OutputFormat {
 // --------------------------------------------------------------------
 // main function
 
-/// Configure and initialize logging at the given level
-fn init_logging(level: simplelog::LevelFilter) {
-    let logging_config = simplelog::ConfigBuilder::new()
-        .set_level_color(simplelog::Level::Info, Some(simplelog::Color::Green))
-        .set_level_color(simplelog::Level::Trace, Some(simplelog::Color::Magenta))
-        .build();
+/// Writes this crate's log records to stderr. Info lines are printed bare;
+/// other levels carry a `warning:`-style prefix, coloured when `colour` is set.
+struct StderrLogger {
+    colour: bool,
+}
 
-    simplelog::TermLogger::init(
-        level,
-        logging_config,
-        simplelog::TerminalMode::Stderr,
-        simplelog::ColorChoice::Auto,
-    )
-    .expect("could not initialize logging");
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // Dependencies such as globset log at debug, which `-v` should not show
+        metadata.level() <= log::max_level() && metadata.target().starts_with("reclean")
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let (prefix, sgr) = match record.level() {
+            log::Level::Info => ("", ""),
+            log::Level::Error => ("error: ", "1;31"),
+            log::Level::Warn => ("warning: ", "1;33"),
+            log::Level::Debug => ("debug: ", "36"),
+            log::Level::Trace => ("trace: ", "35"),
+        };
+        // `eprintln!` panics when stderr is closed, which would abort a run
+        // mid-report; a lost log line is the lesser failure.
+        let mut err = io::stderr().lock();
+        let _ = if self.colour && !prefix.is_empty() {
+            writeln!(err, "\x1b[{sgr}m{prefix}\x1b[0m{}", record.args())
+        } else {
+            writeln!(err, "{prefix}{}", record.args())
+        };
+    }
+
+    fn flush(&self) {}
+}
+
+/// Route log records to stderr at the given level. Prefixes are coloured only
+/// on a terminal, and never when `NO_COLOR` is set to a non-empty value.
+fn init_logging(level: log::LevelFilter) {
+    let colour =
+        io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let logger = Box::leak(Box::new(StderrLogger { colour }));
+    log::set_logger(logger).expect("could not initialize logging");
+    log::set_max_level(level);
 }
 
 /// Generate default config file: '.reclean.toml'
@@ -167,7 +197,6 @@ fn run_job(config: CleanConfig) -> Result<i32> {
     }
 
     if job.has_failures() {
-        error!("{} deletion(s) failed", job.failed_deletions.len());
         return Ok(1);
     }
     if job.has_warnings() {
@@ -205,11 +234,9 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<i
         })?
     };
 
-    let config_file = resolved_path.to_str().unwrap_or(SETTINGS_FILENAME);
-
-    info!("using settings file: {config_file:?}");
-    let contents = fs::read_to_string(config_file).map_err(|e| {
-        reclean::CleanError::ConfigError(format!("Cannot read {:?}: {}", config_file, e))
+    info!("using settings file: {resolved_path:?}");
+    let contents = fs::read_to_string(&resolved_path).map_err(|e| {
+        reclean::CleanError::ConfigError(format!("Cannot read {:?}: {}", resolved_path, e))
     })?;
     let mut config: CleanConfig = toml::from_str(&contents).map_err(|e| {
         reclean::CleanError::ConfigError(format!("Cannot deserialize from .toml: {}", e))
@@ -278,12 +305,20 @@ fn run(args: Args) -> Result<i32> {
         return Ok(0);
     }
 
+    // Printed to stdout, one name per line, so the lists can be piped
     if args.list {
-        info!("default patterns: {:?}", get_default_patterns());
-        info!("protected directories: {:?}", get_protected_dirs());
-        info!("default excludes: {:?}", get_default_excludes());
-        info!("build artifact directories: {:?}", get_artifact_dirs());
-        info!("dependency directories: {:?}", get_dependency_dirs());
+        for (heading, names) in [
+            ("default patterns", get_default_patterns()),
+            ("protected directories", get_protected_dirs()),
+            ("default excludes", get_default_excludes()),
+            ("build artifact directories", get_artifact_dirs()),
+            ("dependency directories", get_dependency_dirs()),
+        ] {
+            println!("{heading}:");
+            for name in names {
+                println!("  {name}");
+            }
+        }
         return Ok(0);
     }
 
@@ -347,11 +382,11 @@ fn main() {
 
     // Determine log level from flags
     let log_level = if args.quiet {
-        simplelog::LevelFilter::Error
+        log::LevelFilter::Error
     } else if args.verbose {
-        simplelog::LevelFilter::Debug
+        log::LevelFilter::Debug
     } else {
-        simplelog::LevelFilter::Info
+        log::LevelFilter::Info
     };
     init_logging(log_level);
 
@@ -363,7 +398,7 @@ fn main() {
             process::exit(code);
         }
         Err(e) => {
-            error!("Error: {}", e);
+            error!("{}", e);
             // Usage and configuration errors are 2, as clap's own are
             let code = match e {
                 reclean::CleanError::ConfigError(_) | reclean::CleanError::GlobError(_) => 2,

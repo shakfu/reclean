@@ -1,0 +1,9 @@
+# Read by tests/test_toml.rs. Not named `.reclean.toml`, so `reclean -c` never discovers it.
+path = "."
+patterns = ["**/__pycache__", "**/.coverage", "**/.DS_Store", "**/.mypy_cache", "**/.pylint_cache", "**/.pytest_cache", "**/.ruff_cache", "**/pip-log.txt", "**/*.pyc"]
+exclude_patterns = ["**/important.pyc"]  # Optional: patterns to exclude
+dry_run = true
+skip_confirmation = false
+include_symlinks = false
+remove_broken_symlinks = false
+stats_mode = false  # Optional: display statistics by pattern

@@ -1,12 +1,24 @@
 use reclean::{CleanConfig, CleaningJob};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use tempfile::TempDir;
 
-/// A project root: `.git`, a marker file, and the build directory it explains
+/// Run git in `dir`, which must succeed
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {:?} failed", args);
+}
+
+/// A project root: a git repository, a marker file, and the build directory it explains
 fn create_project(base: &Path, marker: &str, artifact: &str) {
     fs::create_dir_all(base).unwrap();
-    fs::create_dir(base.join(".git")).unwrap();
+    git(base, &["init", "-q"]);
     fs::write(base.join(marker), "").unwrap();
 
     let out = base.join(artifact).join("obj");
@@ -76,7 +88,7 @@ fn test_marker_without_git_is_not_a_project_root() {
     let temp_dir = TempDir::new().unwrap();
     let base = temp_dir.path();
     create_project(base, "CMakeLists.txt", "build");
-    fs::remove_dir(base.join(".git")).unwrap();
+    fs::remove_dir_all(base.join(".git")).unwrap();
 
     let job = run(base, true);
 
@@ -123,8 +135,18 @@ fn test_git_file_marks_a_submodule_root() {
     create_project(base, "Cargo.toml", "target");
 
     // A submodule marks its git directory with a file, not a directory
-    fs::remove_dir(base.join(".git")).unwrap();
-    fs::write(base.join(".git"), "gitdir: ../.git/modules/sub").unwrap();
+    let git_dir = TempDir::new().unwrap();
+    fs::remove_dir_all(base.join(".git")).unwrap();
+    git(
+        base,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            git_dir.path().join("sub").to_str().unwrap(),
+        ],
+    );
+    assert!(base.join(".git").is_file());
 
     let job = run(base, true);
 
@@ -209,4 +231,34 @@ fn test_nested_repository_is_matched_when_named_as_root() {
 
     assert_eq!(job.counter, 1);
     assert!(!nested.join("target").exists());
+}
+
+#[test]
+fn test_tracked_build_output_is_kept() {
+    // electron-builder keeps installer resources, committed, in `build/`
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    create_project(base, "package.json", "build");
+    git(base, &["add", "build"]);
+
+    let job = run(base, true);
+
+    assert_eq!(job.counter, 0);
+    assert!(base.join("build/obj/a.o").exists());
+}
+
+#[test]
+fn test_build_output_is_kept_when_git_cannot_answer() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    create_project(base, "Cargo.toml", "target");
+    // An empty `.git` is not a repository git can read
+    fs::remove_dir_all(base.join(".git")).unwrap();
+    fs::create_dir(base.join(".git")).unwrap();
+
+    let job = run(base, true);
+
+    assert_eq!(job.counter, 0);
+    assert!(job.has_warnings());
+    assert!(base.join("target/obj/a.o").exists());
 }

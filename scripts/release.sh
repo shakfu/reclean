@@ -1,2 +1,2 @@
 cargo build --release
-cp target/release/reclean /usr/local/bin/
+install -D target/release/reclean "${PREFIX:-$HOME/.local}/bin/reclean"

@@ -291,3 +291,39 @@ fn test_configfile_path_is_reported_in_json() {
 
     assert_eq!(json["config"], config.to_str().unwrap());
 }
+
+#[test]
+fn test_json_distinguishes_cancelled_from_removed() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "xy").unwrap();
+    let args = ["-g", "**/*.pyc", "--format", "json"];
+
+    let out = reclean_with_input(base, &args, b"n");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["summary"]["cancelled"], true);
+    assert_eq!(json["summary"]["removed_count"], 0);
+    assert!(base.join("a.pyc").exists());
+
+    let out = reclean_with_input(base, &args, b"y");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["summary"]["cancelled"], false);
+    assert_eq!(json["summary"]["removed_count"], 1);
+    assert_eq!(json["summary"]["removed_size"], 2);
+    assert!(!base.join("a.pyc").exists());
+}
+
+#[test]
+fn test_list_prints_to_stdout() {
+    let temp_dir = TempDir::new().unwrap();
+    let out = reclean(temp_dir.path(), &["-l", "-q"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(
+        stdout.lines().any(|l| l == "  **/__pycache__"),
+        "{}",
+        stdout
+    );
+    assert!(stdout.lines().any(|l| l == "  node_modules"), "{}", stdout);
+}

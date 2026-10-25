@@ -26,12 +26,12 @@ use dialoguer::Confirm;
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
-use logging_timer::time;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -46,10 +46,6 @@ pub enum CleanError {
     IoError(std::io::Error),
     /// A glob pattern failed to compile.
     GlobError(globset::Error),
-    /// A path resolved outside the allowed working directory.
-    PathTraversal(PathBuf),
-    /// Insufficient permissions to access or remove a path.
-    PermissionDenied(PathBuf),
     /// A configuration or validation error.
     ConfigError(String),
 }
@@ -59,8 +55,6 @@ impl std::fmt::Display for CleanError {
         match self {
             CleanError::IoError(e) => write!(f, "IO error: {}", e),
             CleanError::GlobError(e) => write!(f, "Glob pattern error: {}", e),
-            CleanError::PathTraversal(p) => write!(f, "Path traversal detected: {:?}", p),
-            CleanError::PermissionDenied(p) => write!(f, "Permission denied: {:?}", p),
             CleanError::ConfigError(s) => write!(f, "Configuration error: {}", s),
         }
     }
@@ -560,6 +554,27 @@ where
     });
     let ready = Condvar::new();
 
+    /// Returns a taken item's results to the queue, even when `visit` panics.
+    /// Otherwise `active` never reaches zero and the idle threads wait forever.
+    struct Finished<'a, T> {
+        queue: &'a Mutex<Queue<T>>,
+        ready: &'a Condvar,
+        next: Vec<T>,
+    }
+    impl<T> Drop for Finished<'_, T> {
+        fn drop(&mut self) {
+            let mut guard = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let added = !self.next.is_empty();
+            guard.pending.append(&mut self.next);
+            guard.active -= 1;
+            // Most listings add nothing, and waking every idle thread for that is
+            // wasted. The last active item must still wake them, so they can exit.
+            if added || guard.active == 0 {
+                self.ready.notify_all();
+            }
+        }
+    }
+
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -587,12 +602,12 @@ where
                     return;
                 };
 
-                let mut next = visit(item);
-
-                let mut guard = queue.lock().unwrap();
-                guard.pending.append(&mut next);
-                guard.active -= 1;
-                ready.notify_all();
+                let mut finished = Finished {
+                    queue: &queue,
+                    ready: &ready,
+                    next: Vec::new(),
+                };
+                finished.next = visit(item);
             });
         }
     });
@@ -727,11 +742,6 @@ fn same_object(scanned: &Metadata, current: &Metadata) -> bool {
     scanned.file_type() == current.file_type()
 }
 
-/// Skip the current and parent directory references.
-fn should_process(entry_path: &Path) -> bool {
-    entry_path != Path::new(".") && entry_path != Path::new("..")
-}
-
 /// Whether `path` is build output at the top level of a project.
 ///
 /// The directory name must be paired with a marker file in
@@ -782,6 +792,40 @@ fn is_artifact_dir(path: &Path, name: &OsStr, root: &Path) -> bool {
         }
     }
     true
+}
+
+/// Whether git tracks any file under `path`. Outside a repository nothing is
+/// tracked, and git is not run.
+fn git_tracks(path: &Path) -> std::io::Result<bool> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Ok(false);
+    };
+    // An unreadable `.git` counts as present, as in `is_artifact_dir`
+    let in_repository = parent.canonicalize()?.ancestors().any(|dir| {
+        !matches!(fs::symlink_metadata(dir.join(".git")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    });
+    if !in_repository {
+        return Ok(false);
+    }
+    let out = Command::new("git")
+        .arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(parent)
+        .args(["ls-files", "-z", "--"])
+        .arg(name)
+        // Inherited from a git hook, these would point at another repository
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .stdin(Stdio::null())
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+    }
+    Ok(!out.stdout.is_empty())
 }
 
 /// The restore command for `path` when it is a dependency tree: its name is in
@@ -849,6 +893,22 @@ impl Scan<'_> {
         }
     }
 
+    /// Whether `path` holds files git tracks, which makes it source whatever its
+    /// name. A git that cannot answer counts as tracked.
+    fn is_tracked(&self, path: &Path) -> bool {
+        match git_tracks(path) {
+            Ok(false) => false,
+            Ok(true) => {
+                self.note(format!("Tracked by git, keeping: {:?}", path.display()));
+                true
+            }
+            Err(e) => {
+                self.skip(path, format!("git cannot say whether it is tracked: {}", e));
+                true
+            }
+        }
+    }
+
     /// List one directory, collecting what matches and returning what to descend into.
     fn visit_dir(&self, dir: PathBuf) -> Vec<PathBuf> {
         // The walk never follows symlinks, so an entry can only escape `base_path`
@@ -894,17 +954,16 @@ impl Scan<'_> {
                     continue;
                 }
             };
-            if self.consider(&path, Some(&entry.file_name()), file_type) {
+            if self.consider(&path, &entry.file_name(), file_type) {
                 subdirs.push(path);
             }
         }
         subdirs
     }
 
-    /// Decide what to do with one entry, returning whether to descend into it.
-    ///
-    /// A `name` of `None` marks the root, which protection does not apply to.
-    fn consider(&self, path: &Path, name: Option<&OsStr>, file_type: fs::FileType) -> bool {
+    /// Decide what to do with one entry below the root, returning whether to
+    /// descend into it.
+    fn consider(&self, path: &Path, name: &OsStr, file_type: fs::FileType) -> bool {
         let processed = self.processed.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(ref pb) = self.progress {
             if processed.is_multiple_of(100) {
@@ -916,52 +975,47 @@ impl Scan<'_> {
             }
         }
 
-        let is_root = name.is_none();
-
-        if !should_process(path) {
-            // For the root this only rules out matching, never traversal: the
-            // default path is `.`, which `should_process` rejects by name.
-            return is_root && file_type.is_dir();
-        }
-
         // Protected names are neither matched nor entered
-        if let Some(name) = name {
-            if self
-                .config
-                .protected_dirs
-                .iter()
-                .any(|d| OsStr::new(d) == name)
-            {
-                debug!("Protected, skipping: {:?}", path.display());
-                return false;
-            }
+        if self
+            .config
+            .protected_dirs
+            .iter()
+            .any(|d| OsStr::new(d) == name)
+        {
+            debug!("Protected, skipping: {:?}", path.display());
+            return false;
         }
 
         let is_dir = file_type.is_dir();
         let is_symlink = file_type.is_symlink();
 
+        // Patterns see the path below the root. With the root's own text included,
+        // `*tmp*` matched every path under /tmp, and `src/*.c` matched nothing.
+        let relative = path.strip_prefix(self.root).unwrap_or(path);
+
         // Excluded entries are neither matched nor entered. The check runs ahead of
         // the include match so that excluding a directory prunes the walk: a
         // virtualenv is skipped in one step rather than scanned and rejected file by
-        // file. The root is exempt, as pointing reclean at an excluded directory is
-        // deliberate.
+        // file.
         let excluded =
-            |set: &Option<GlobSet>| !is_root && set.as_ref().is_some_and(|set| set.is_match(path));
+            |set: &Option<GlobSet>| set.as_ref().is_some_and(|set| set.is_match(relative));
         if excluded(self.exclude_set) {
-            self.note(format!("Excluded: {:?}", path.display()));
+            debug!("Excluded: {:?}", path.display());
             return false;
         }
 
         // A dependency tree is checked ahead of the built-in excludes: `.venv` is
         // excluded to save scanning it, and a lock beside it asks for it whole.
         if self.config.dependencies && is_dir {
-            if let Some(restore) = name.and_then(|n| dependency_restore(path, n)) {
-                self.collect(path, Reason::Dependency, Some(restore), String::new());
-                return false;
+            if let Some(restore) = dependency_restore(path, name) {
+                if !self.is_tracked(path) {
+                    self.collect(path, Reason::Dependency, Some(restore), String::new());
+                    return false;
+                }
             }
         }
         if excluded(self.default_exclude_set) {
-            self.note(format!("Excluded: {:?}", path.display()));
+            debug!("Excluded: {:?}", path.display());
             return false;
         }
 
@@ -973,11 +1027,12 @@ impl Scan<'_> {
 
         // A pattern match is the cheaper reason to report, so build output is
         // only looked for when no pattern matched.
-        let reason = if self.include_set.is_match(path) {
+        let reason = if self.include_set.is_match(relative) {
             Reason::Pattern
         } else if self.config.build_artifacts
             && is_dir
-            && name.is_some_and(|n| is_artifact_dir(path, n, self.root))
+            && is_artifact_dir(path, name, self.root)
+            && !self.is_tracked(path)
         {
             Reason::BuildArtifact
         } else {
@@ -993,7 +1048,7 @@ impl Scan<'_> {
         // matcher pass is skipped when neither is on.
         let pattern =
             if reason == Reason::Pattern && (self.config.stats_mode || self.config.json_mode) {
-                find_matching_pattern(self.matchers, path).unwrap_or_default()
+                find_matching_pattern(self.matchers, relative).unwrap_or_default()
             } else {
                 String::new()
             };
@@ -1055,6 +1110,12 @@ pub struct CleaningJob {
     pub stats: HashMap<String, (usize, u64)>,
     /// Per-reason statistics: reason -> (count, total bytes), cheapest to restore first.
     pub reasons: BTreeMap<Reason, (usize, u64)>,
+    /// Whether the confirmation prompt was declined.
+    pub cancelled: bool,
+    /// Number of targets removed.
+    pub removed_count: usize,
+    /// Bytes reclaimed by the removed targets.
+    pub removed_size: u64,
     /// Paths that could not be deleted, with error messages.
     pub failed_deletions: Vec<(PathBuf, String)>,
     /// Matched items collected for JSON output.
@@ -1074,6 +1135,9 @@ impl CleaningJob {
             counter: 0,
             stats: HashMap::new(),
             reasons: BTreeMap::new(),
+            cancelled: false,
+            removed_count: 0,
+            removed_size: 0,
             failed_deletions: Vec::new(),
             matched_items: Vec::new(),
             warnings: Vec::new(),
@@ -1093,8 +1157,8 @@ impl CleaningJob {
     /// Produce JSON output summarizing the run
     pub fn to_json(&self) -> std::result::Result<String, serde_json::Error> {
         let stats: Vec<_> = self
-            .stats
-            .iter()
+            .sorted_stats()
+            .into_iter()
             .map(|(pattern, (count, size))| {
                 serde_json::json!({
                     "pattern": pattern,
@@ -1149,6 +1213,9 @@ impl CleaningJob {
                 "total_size": self.size,
                 "total_size_human": format_size(self.size),
                 "dry_run": self.config.dry_run,
+                "cancelled": self.cancelled,
+                "removed_count": self.removed_count,
+                "removed_size": self.removed_size,
             },
             "stats": stats,
             "reasons": reasons,
@@ -1164,9 +1231,10 @@ impl CleaningJob {
         self.config.skip_confirmation && !self.config.dry_run
     }
 
-    /// Run the cleaning job
-    #[time("info")]
+    /// Run the cleaning job. Results from an earlier run are discarded.
     pub fn run(&mut self) -> Result<()> {
+        *self = Self::new(std::mem::take(&mut self.config));
+
         let path_str = self.config.path.clone();
         let path = Path::new(&path_str);
 
@@ -1217,6 +1285,7 @@ impl CleaningJob {
             && !confirm("Do you want to delete the above?")?
         {
             warn!("Cleaning operation cancelled.");
+            self.cancelled = true;
             return Ok(());
         }
 
@@ -1303,9 +1372,10 @@ impl CleaningJob {
             warnings: Mutex::new(Vec::new()),
         };
 
-        // The root is considered on its own, exempt from protection: pointing reclean
-        // at `.git` is a deliberate act, and silently doing nothing there would be
-        // its own trap.
+        // The root is never a target: a pattern matching it would claim the whole
+        // tree. It is also exempt from protection and excludes: pointing reclean at
+        // `.git` or `.venv` is a deliberate act, and silently doing nothing there
+        // would be its own trap.
         let root_type = fs::symlink_metadata(path)
             .map_err(|e| {
                 CleanError::IoError(std::io::Error::new(
@@ -1320,7 +1390,7 @@ impl CleaningJob {
         let walk = if root_type.is_symlink() {
             fs::metadata(path).is_ok_and(|m| m.is_dir())
         } else {
-            scan.consider(path, None, root_type)
+            root_type.is_dir()
         };
         if walk {
             parallel_dir_queue(vec![path.to_path_buf()], |dir| scan.visit_dir(dir));
@@ -1479,12 +1549,11 @@ impl CleaningJob {
             }
         });
 
-        let (mut removed, mut reclaimed) = (0usize, 0u64);
         for (target, result) in targets.iter().zip(results) {
             match result.into_inner() {
                 Some(Ok(())) => {
-                    removed += 1;
-                    reclaimed += target.size;
+                    self.removed_count += 1;
+                    self.removed_size += target.size;
                     if announce {
                         info!("Deleted: {:?}", target.path.display());
                     }
@@ -1497,16 +1566,23 @@ impl CleaningJob {
             }
         }
 
-        if !self.config.json_mode && removed > 0 {
+        if !self.config.json_mode && self.removed_count > 0 {
             info!(
                 "Deleted {} item(s) totalling {}",
-                removed,
-                format_size(reclaimed)
+                self.removed_count,
+                format_size(self.removed_size)
             );
         }
         if !self.failed_deletions.is_empty() {
             error!("{} removal(s) failed", self.failed_deletions.len());
         }
+    }
+
+    /// Per-pattern statistics, most matches first, then by pattern
+    fn sorted_stats(&self) -> Vec<(&String, &(usize, u64))> {
+        let mut stats: Vec<_> = self.stats.iter().collect();
+        stats.sort_by(|(a, (m, _)), (b, (n, _))| n.cmp(m).then(a.cmp(b)));
+        stats
     }
 
     /// Display statistics about matches
@@ -1516,10 +1592,7 @@ impl CleaningJob {
         }
 
         info!("\n=== Statistics ===");
-        let mut patterns: Vec<_> = self.stats.iter().collect();
-        patterns.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count)); // count descending
-
-        for (pattern, (count, size)) in patterns {
+        for (pattern, (count, size)) in self.sorted_stats() {
             info!("  {}: {} item(s), {}", pattern, count, format_size(*size));
         }
         info!("==================\n");
@@ -1638,7 +1711,9 @@ mod tests {
         );
     }
 
+    // Elsewhere `same_object` compares only the type, so a replaced file passes
     #[test]
+    #[cfg(unix)]
     fn replaced_file_is_not_removed() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let base = temp_dir.path().canonicalize().unwrap();
