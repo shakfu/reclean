@@ -279,9 +279,10 @@ fn config_dirs(
     platform: Option<PathBuf>,
 ) -> Vec<PathBuf> {
     // The XDG spec says a relative XDG_CONFIG_HOME is invalid and ignored.
+    // `has_root` over `is_absolute`: a Windows host needs a drive for the latter.
     let xdg_dir = xdg
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+        .filter(|p| p.has_root())
         .or_else(|| home.map(|h| h.join(".config")));
     match os {
         "windows" => platform.into_iter().collect(),
