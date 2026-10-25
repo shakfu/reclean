@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ### Added
 
+- `--color=auto|always|never`. `always` forces colour through a pipe and overrides `NO_COLOR`. Clap's help and error messages, the progress spinner and the confirmation prompt follow the same setting. The spinner and prompt ignored `NO_COLOR` before.
+
 - CI runs `cargo fmt --check`, clippy with warnings denied, and `cargo test` on Linux, macOS and Windows.
 
 - CI tests the minimum supported Rust version, now declared as `rust-version = "1.88"`, and runs `cargo audit`. 1.88 is the floor set by `globset` and `time`. `Cargo.lock` is no longer gitignored.
@@ -33,6 +35,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 - JSON `summary` adds `cancelled`, `removed_count` and `removed_size`. A declined prompt produced the same document as a completed deletion.
 
 ### Changed
+
+- Info lines are green again on a terminal, as before 0.6.0. They keep the 0.6.0 format: no timestamp or `[INFO]` tag. `NO_COLOR` still disables colour.
 
 - Every config file key is optional. Before, a file missing `path`, `patterns`, `dry_run`, `skip_confirmation`, `include_symlinks` or `remove_broken_symlinks` failed with `missing field`. A missing key now takes its default; a missing `patterns` means the built-in patterns, as without `--glob`. `patterns = []` still matches nothing, and unknown keys are still an error.
 

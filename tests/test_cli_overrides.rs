@@ -327,3 +327,56 @@ fn test_list_prints_to_stdout() {
     );
     assert!(stdout.lines().any(|l| l == "  node_modules"), "{}", stdout);
 }
+
+#[test]
+fn test_color_always_colours_piped_output_despite_no_color() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_reclean"))
+        .current_dir(base)
+        .args(["-d", "--color", "always"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success());
+    assert!(err.contains("\x1b[32m"), "{:?}", err);
+}
+
+#[test]
+fn test_color_auto_and_never_leave_piped_output_plain() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    for args in [&["-d"][..], &["-d", "--color", "never"]] {
+        let out = reclean(base, args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success());
+        assert!(err.contains("a.pyc"), "{:?}", err);
+        assert!(!err.contains('\x1b'), "{:?}", err);
+    }
+}
+
+#[test]
+fn test_color_flag_reaches_clap_help_and_errors() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+
+    let help = reclean(base, &["--color=always", "-h"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains('\x1b'));
+
+    // `--color` after the bad argument still applies
+    let bad = reclean(base, &["--bogus", "--color", "always"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains('\x1b'));
+
+    for args in [&["-h"][..], &["--color", "never", "-h"]] {
+        let out = reclean(base, args);
+        assert!(!String::from_utf8_lossy(&out.stdout).contains('\x1b'));
+    }
+}

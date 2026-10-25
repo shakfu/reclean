@@ -1,9 +1,10 @@
 // --------------------------------------------------------------------
 // imports
 
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser, ValueEnum};
 use clap_complete::{generate, Shell};
 use log::{error, info};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -102,6 +103,10 @@ struct Args {
     #[arg(long, default_value = "text")]
     format: OutputFormat,
 
+    /// When to colour stderr output (auto: on a terminal, unless NO_COLOR is set)
+    #[arg(long, value_name = "WHEN", default_value = "auto")]
+    color: clap::ColorChoice,
+
     /// List default patterns, excludes, protected, artifact and dependency names
     #[arg(short, long)]
     list: bool,
@@ -116,8 +121,9 @@ enum OutputFormat {
 // --------------------------------------------------------------------
 // main function
 
-/// Writes this crate's log records to stderr. Info lines are printed bare;
-/// other levels carry a `warning:`-style prefix, coloured when `colour` is set.
+/// Writes this crate's log records to stderr. Info lines have no prefix and
+/// are green; other levels carry a coloured `warning:`-style prefix. Colour
+/// applies only when `colour` is set.
 struct StderrLogger {
     colour: bool,
 }
@@ -133,7 +139,7 @@ impl log::Log for StderrLogger {
             return;
         }
         let (prefix, sgr) = match record.level() {
-            log::Level::Info => ("", ""),
+            log::Level::Info => ("", "32"),
             log::Level::Error => ("error: ", "1;31"),
             log::Level::Warn => ("warning: ", "1;33"),
             log::Level::Debug => ("debug: ", "36"),
@@ -142,7 +148,10 @@ impl log::Log for StderrLogger {
         // `eprintln!` panics when stderr is closed, which would abort a run
         // mid-report; a lost log line is the lesser failure.
         let mut err = io::stderr().lock();
-        let _ = if self.colour && !prefix.is_empty() {
+        // Info has no prefix, so the whole line takes its colour
+        let _ = if self.colour && prefix.is_empty() {
+            writeln!(err, "\x1b[{sgr}m{}\x1b[0m", record.args())
+        } else if self.colour {
             writeln!(err, "\x1b[{sgr}m{prefix}\x1b[0m{}", record.args())
         } else {
             writeln!(err, "{prefix}{}", record.args())
@@ -152,11 +161,39 @@ impl log::Log for StderrLogger {
     fn flush(&self) {}
 }
 
-/// Route log records to stderr at the given level. Prefixes are coloured only
-/// on a terminal, and never when `NO_COLOR` is set to a non-empty value.
-fn init_logging(level: log::LevelFilter) {
-    let colour =
-        io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+/// Resolve `--color`. `auto` colours only a terminal, and never when `NO_COLOR`
+/// is set to a non-empty value; `always` overrides `NO_COLOR`.
+fn colour_enabled(choice: clap::ColorChoice) -> bool {
+    match choice {
+        clap::ColorChoice::Always => true,
+        clap::ColorChoice::Never => false,
+        clap::ColorChoice::Auto => {
+            io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+        }
+    }
+}
+
+/// Find `--color` before parsing, so clap's own help and errors obey it.
+/// The last valid value wins; an invalid one is left for clap to reject.
+fn prescan_color(argv: &[OsString]) -> clap::ColorChoice {
+    let mut choice = clap::ColorChoice::Auto;
+    let mut iter = argv.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        let value = match arg.to_str() {
+            Some("--") => break,
+            Some("--color") => iter.next().and_then(|v| v.to_str()),
+            Some(a) => a.strip_prefix("--color="),
+            None => None,
+        };
+        if let Some(c) = value.and_then(|v| clap::ColorChoice::from_str(v, false).ok()) {
+            choice = c;
+        }
+    }
+    choice
+}
+
+/// Route log records to stderr at the given level.
+fn init_logging(level: log::LevelFilter, colour: bool) {
     let logger = Box::leak(Box::new(StderrLogger { colour }));
     log::set_logger(logger).expect("could not initialize logging");
     log::set_max_level(level);
@@ -378,7 +415,11 @@ fn run(args: Args) -> Result<i32> {
 
 /// main function
 fn main() {
-    let args = Args::parse();
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let matches = Args::command()
+        .color(prescan_color(&argv))
+        .get_matches_from(argv);
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     // Determine log level from flags
     let log_level = if args.quiet {
@@ -388,7 +429,11 @@ fn main() {
     } else {
         log::LevelFilter::Info
     };
-    init_logging(log_level);
+    let colour = colour_enabled(args.color);
+    // The progress spinner and confirmation prompt colour through `console`,
+    // which ignores `NO_COLOR` unless told otherwise
+    dialoguer::console::set_colors_enabled_stderr(colour);
+    init_logging(log_level, colour);
 
     match run(args) {
         Ok(0) => {}

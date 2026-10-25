@@ -68,6 +68,7 @@ Options:
   -q, --quiet                   Suppress all output except errors
       --completions <SHELL>     Generate shell completions (bash, zsh, fish, elvish, powershell) [possible values: bash, elvish, fish, powershell, zsh]
       --format <FORMAT>         Output format (text or json) [default: text] [possible values: text, json]
+      --color <WHEN>            When to colour stderr output (auto: on a terminal, unless NO_COLOR is set) [default: auto] [possible values: auto, always, never]
   -l, --list                    List default patterns, excludes, protected, artifact and dependency names
   -h, --help                    Print help
   -V, --version                 Print version
