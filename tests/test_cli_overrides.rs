@@ -12,14 +12,15 @@ fn write_config(dir: &Path, target: &Path) -> std::path::PathBuf {
         &config,
         format!(
             r#"
-path = "{}"
+path = {}
 patterns = ["**/*.pyc"]
 dry_run = false
 skip_confirmation = true
 include_symlinks = false
 remove_broken_symlinks = false
 "#,
-            target.display()
+            // Quoted by toml: a Windows path's backslashes are TOML escapes
+            toml::Value::String(target.display().to_string())
         ),
     )
     .unwrap();
