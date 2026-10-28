@@ -22,19 +22,55 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+## [0.6.0]
+
 ### Added
 
-- CI runs `cargo fmt --check`, clippy with warnings denied, and `cargo test` on Linux and macOS.
+- `--color=auto|always|never`. `always` forces colour through a pipe and overrides `NO_COLOR`. Clap's help and error messages, the progress spinner and the confirmation prompt follow the same setting. The spinner and prompt ignored `NO_COLOR` before.
+
+- CI runs `cargo fmt --check`, clippy with warnings denied, and `cargo test` on Linux, macOS and Windows.
+
+- CI tests the minimum supported Rust version, now declared as `rust-version = "1.88"`, and runs `cargo audit`. 1.88 is the floor set by `globset` and `time`. `Cargo.lock` is no longer gitignored.
+
+- JSON `summary` adds `cancelled`, `removed_count` and `removed_size`. A declined prompt produced the same document as a completed deletion.
 
 ### Changed
+
+- Info lines are green again on a terminal, as before 0.6.0. They keep the 0.6.0 format: no timestamp or `[INFO]` tag. `NO_COLOR` still disables colour.
 
 - Every config file key is optional. Before, a file missing `path`, `patterns`, `dry_run`, `skip_confirmation`, `include_symlinks` or `remove_broken_symlinks` failed with `missing field`. A missing key now takes its default; a missing `patterns` means the built-in patterns, as without `--glob`. `patterns = []` still matches nothing, and unknown keys are still an error.
 
 - The defaults no longer include `.bash_history` or `.python_history`. Shell and REPL history is user data that nothing regenerates, which the default list's own rule excludes. Remove it with `-g '**/.bash_history'` if wanted.
 
+- **`-B` and `-D` keep a directory that holds files git tracks.** electron-builder keeps installer resources in `build/`, some libraries commit `dist/`, and Go projects often commit `vendor/`. `git ls-files` decides, run only inside a repository. If git cannot answer, the directory is kept with a warning (exit 3). The `-B`/`-D` tests now need `git`.
+
+- `--list` prints to stdout, one name per line, so it can be piped and survives `-q`.
+
+- Excluded paths are logged at debug level, not info. The `run(), Elapsed=...` line is gone, along with the `logging_timer` dependency.
+
+- Output drops the timestamp and `[INFO]` tag. Info lines print bare; warnings and errors carry `warning:` or `error:`, coloured on a terminal unless `NO_COLOR` is set. A small stderr logger replaces `simplelog`, which also removes the `time` crate. Dependencies' log records are no longer shown under `-v`.
+
+- `toml` 0.8 -> 0.9.
+
+### Removed
+
+- `CleanError::PathTraversal` and `CleanError::PermissionDenied`, which were never constructed.
+
 ### Fixed
 
 - Removal resolved each target's path again after checking it, so a directory swapped for a symlink, or replaced by another directory, between the check and the removal was still removed. On Unix, removal now walks from the root with `O_NOFOLLOW` through directory descriptors, confirms the target's device and inode on the descriptor it removes through, and empties directories through descriptors. Other platforms keep the path-based check.
+
+- **A pattern matching the `--path` text deleted the whole tree.** Patterns were tested against the walked path with the root prefix included, and `*` matches `/`. `reclean -p ~/cache-tests -g '*cache*' -y` collected the root as one target. Patterns now match the path below the root, and the root is never a target. This also makes relative patterns work: `-g 'src/*.c'` and `-e docs/keep.pyc` matched nothing, since walked paths began `./`.
+
+- A non-UTF-8 config path fell back to reading `./.reclean.toml`.
+
+- `CleaningJob::run` called twice reported doubled totals.
+
+- JSON `stats` came out in hash order; it is now sorted by count, then pattern.
+
+- A panic in a walker thread hung the run instead of failing it.
+
+- `make uninstall` removed `/usr/local/bin/reclean`, not what `make install` installed. Both now use `PREFIX`, default `~/.local`, as does `scripts/release.sh`.
 
 - On macOS the global config was read from `~/Library/Application Support/reclean/config.toml`, the platform default of `dirs::config_dir()`, not the documented `~/.config/reclean/config.toml`. macOS now reads `$XDG_CONFIG_HOME/reclean/config.toml` when that is absolute, else `~/.config/reclean/config.toml`, as Linux always did. The 0.5.0 location is still read as a fallback, with a warning naming the new one. Windows keeps `%APPDATA%`. The "no config found" error lists every location searched.
 

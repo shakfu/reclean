@@ -19,8 +19,6 @@ dirs = [
 
 files = [
     # file
-    ".bash_history",
-    ".python_history",
     "pip-log.txt",
 ]
 

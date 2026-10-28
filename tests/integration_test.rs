@@ -141,8 +141,8 @@ fn test_broken_symlink_removal() {
     let mut job = CleaningJob::new(config);
     job.run().unwrap();
 
-    // Broken symlink should be removed
-    assert!(!link.exists());
+    // Broken symlink should be removed; `exists()` follows it, so it cannot tell
+    assert!(fs::symlink_metadata(&link).is_err());
 }
 
 #[test]

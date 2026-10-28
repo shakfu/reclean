@@ -12,14 +12,15 @@ fn write_config(dir: &Path, target: &Path) -> std::path::PathBuf {
         &config,
         format!(
             r#"
-path = "{}"
+path = {}
 patterns = ["**/*.pyc"]
 dry_run = false
 skip_confirmation = true
 include_symlinks = false
 remove_broken_symlinks = false
 "#,
-            target.display()
+            // Quoted by toml: a Windows path's backslashes are TOML escapes
+            toml::Value::String(target.display().to_string())
         ),
     )
     .unwrap();
@@ -290,4 +291,93 @@ fn test_configfile_path_is_reported_in_json() {
     let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
 
     assert_eq!(json["config"], config.to_str().unwrap());
+}
+
+#[test]
+fn test_json_distinguishes_cancelled_from_removed() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "xy").unwrap();
+    let args = ["-g", "**/*.pyc", "--format", "json"];
+
+    let out = reclean_with_input(base, &args, b"n");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["summary"]["cancelled"], true);
+    assert_eq!(json["summary"]["removed_count"], 0);
+    assert!(base.join("a.pyc").exists());
+
+    let out = reclean_with_input(base, &args, b"y");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["summary"]["cancelled"], false);
+    assert_eq!(json["summary"]["removed_count"], 1);
+    assert_eq!(json["summary"]["removed_size"], 2);
+    assert!(!base.join("a.pyc").exists());
+}
+
+#[test]
+fn test_list_prints_to_stdout() {
+    let temp_dir = TempDir::new().unwrap();
+    let out = reclean(temp_dir.path(), &["-l", "-q"]);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(
+        stdout.lines().any(|l| l == "  **/__pycache__"),
+        "{}",
+        stdout
+    );
+    assert!(stdout.lines().any(|l| l == "  node_modules"), "{}", stdout);
+}
+
+#[test]
+fn test_color_always_colours_piped_output_despite_no_color() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_reclean"))
+        .current_dir(base)
+        .args(["-d", "--color", "always"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success());
+    assert!(err.contains("\x1b[32m"), "{:?}", err);
+}
+
+#[test]
+fn test_color_auto_and_never_leave_piped_output_plain() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    for args in [&["-d"][..], &["-d", "--color", "never"]] {
+        let out = reclean(base, args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success());
+        assert!(err.contains("a.pyc"), "{:?}", err);
+        assert!(!err.contains('\x1b'), "{:?}", err);
+    }
+}
+
+#[test]
+fn test_color_flag_reaches_clap_help_and_errors() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+
+    let help = reclean(base, &["--color=always", "-h"]);
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains('\x1b'));
+
+    // `--color` after the bad argument still applies
+    let bad = reclean(base, &["--bogus", "--color", "always"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad.stderr).contains('\x1b'));
+
+    for args in [&["-h"][..], &["--color", "never", "-h"]] {
+        let out = reclean(base, args);
+        assert!(!String::from_utf8_lossy(&out.stdout).contains('\x1b'));
+    }
 }

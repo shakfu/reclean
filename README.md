@@ -32,7 +32,7 @@ A fast, safe Rust command-line utility for recursively removing files and direct
 # Install from crates.io
 cargo install reclean
 
-# Or build and install to /usr/local/bin
+# Or build and install to ~/.local/bin (set PREFIX to change)
 make install
 
 # Or build release binary
@@ -48,29 +48,30 @@ Safely remove files and directories matching a set of glob patterns.
 Usage: reclean [OPTIONS]
 
 Options:
-  -p, --path <PATH>               Working directory [default: .]
-  -g, --glob <GLOB>               Include glob pattern(s) (can specify multiple)
-  -e, --exclude <EXCLUDE>         Exclude glob pattern(s) (can specify multiple)
-  -c, --configfile [PATH]         Load config (searches upward, then ~/.config/reclean/)
-  -w, --write-configfile          Write default '.reclean.toml' file
-  -d, --dry-run                   Preview deletions without removing
-  -y, --skip-confirmation         Skip confirmation prompt
-  -s, --stats                     Display statistics by pattern
-  -o, --older-than <DURATION>     Only remove files older than duration (e.g., "30d", "7d", "24h")
-      --larger-than <SIZE>        Only remove targets of at least this size (e.g., "100M", "1.5G")
-  -P, --progress                  Show progress bar during scanning
-  -i, --include-symlinks          Include matched symlinks for removal
-  -r, --remove-broken-symlinks    Remove broken symlinks
-  -B, --build-artifacts           Also match build output at the top level of a project
-  -D, --dependencies              Also match dependency trees beside their lock file
-  -v, --verbose                   Increase verbosity (debug-level logging)
-  -q, --quiet                     Suppress all output except errors
-  -l, --list                      List default glob patterns
-      --completions <SHELL>       Generate shell completions (bash, zsh, fish, elvish, powershell)
-      --format <FORMAT>           Output format: text (default) or json
-      --no-protect                Match inside protected (.git, .ssh, ...) and excluded-by-default (.venv) directories
-  -h, --help                      Print help
-  -V, --version                   Print version
+  -p, --path <PATH>             Working directory [default: .]
+  -g, --glob <GLOB>             Include glob pattern(s), matched below the working directory
+  -e, --exclude <EXCLUDE>       Exclude glob pattern(s); an excluded directory is not entered
+  -c, --configfile [<PATH>]     Load config (searches upward, then ~/.config/reclean/)
+  -w, --write-configfile        Write default '.reclean.toml' file
+  -d, --dry-run                 Preview deletions without removing
+  -y, --skip-confirmation       Skip confirmation prompt
+  -i, --include-symlinks        Include matched symlinks for removal
+  -r, --remove-broken-symlinks  Remove broken symlinks
+  -B, --build-artifacts         Also match build output at the top level of a project (build, target, dist, ...)
+  -D, --dependencies            Also match dependency trees beside their lock file (node_modules, .venv, vendor)
+  -s, --stats                   Display statistics by pattern
+  -o, --older-than <DURATION>   Only remove targets older than this duration (e.g., "30d", "7d", "24h")
+      --larger-than <SIZE>      Only remove targets of at least this size (e.g., "100M", "1.5G", "4096")
+  -P, --progress                Show progress bar during scanning
+      --no-protect              Match inside protected (.git, .ssh, ...) and excluded-by-default (.venv) directories
+  -v, --verbose                 Increase verbosity (debug-level logging)
+  -q, --quiet                   Suppress all output except errors
+      --completions <SHELL>     Generate shell completions (bash, zsh, fish, elvish, powershell) [possible values: bash, elvish, fish, powershell, zsh]
+      --format <FORMAT>         Output format (text or json) [default: text] [possible values: text, json]
+      --color <WHEN>            When to colour stderr output (auto: on a terminal, unless NO_COLOR is set) [default: auto] [possible values: auto, always, never]
+  -l, --list                    List default patterns, excludes, protected, artifact and dependency names
+  -h, --help                    Print help
+  -V, --version                 Print version
 ```
 
 ### Examples
@@ -128,6 +129,8 @@ reclean -y -q
 ## Default Patterns
 
 With no `--glob`, reclean matches caches and OS debris: `__pycache__`, `*.pyc`, `*.pyo`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.coverage`, `.DS_Store`, `Thumbs.db`, and a few more. Shell and REPL history (`.bash_history`, `.python_history`) is user data and is left alone; name it with `-g` to remove it. `reclean -l` prints the full list. `--glob` replaces it.
+
+Patterns match the path below `--path`: from the project root, `src/*.c` matches `./src/main.c`. `*` also matches `/`, so `*.pyc` matches at any depth. The `--path` directory itself is never a target, only what is under it.
 
 Build output and dependency trees are not patterns. Their names (`build`, `target`, `vendor`, `node_modules`) are too ordinary to match safely by name alone, so they are matched by project layout under `-B` and `-D`. A name-only match remains available as a glob: `reclean -g "**/node_modules"`.
 
@@ -190,6 +193,8 @@ When you run `reclean -c` (without a path), the tool searches for configuration 
 
 You can also specify an explicit path: `reclean -c path/to/config.toml`.
 
+A relative `path` in a config file resolves against the current directory, not the config file's directory. A `.reclean.toml` found in a parent directory with `path = "."` cleans the current directory. `reclean -w` writes `.reclean.toml` to the current directory, whatever `--path` says.
+
 CLI flags always override config file values (e.g., `reclean -c --dry-run` forces dry-run even if the config says `dry_run = false`).
 
 Unknown keys are an error, so a misspelt `dry_run` stops the run instead of being ignored.
@@ -221,7 +226,7 @@ The document opens with `"schema": 1`, which changes when a field changes meanin
 
 - `matches` - Array of matched items with `path`, `size`, `pattern`, `reason`, `type` (`directory`, `file` or `symlink`), and `restore` for a dependency tree
 
-- `summary` - Total count, size (bytes and human-readable), dry-run flag
+- `summary` - Total count, size (bytes and human-readable), dry-run flag, `cancelled` when the prompt was declined, and `removed_count` and `removed_size` for what was actually removed
 
 - `stats` - Per-pattern breakdown (count, size) when `--stats` is enabled
 
@@ -262,6 +267,8 @@ A matched directory is one deletion target and is not entered, so its contents a
 
 The project must also be the outermost one below `--path`. A submodule or vendored checkout carries its own `.git` and marker, so if any directory between it and `--path` holds a `.git`, its build output is skipped. Name the nested project on `--path` to clean it directly.
 
+A directory holding any file git tracks is kept: it is source, whatever its name. electron-builder's `build/` and a committed `dist/` are the usual cases. If git cannot answer, the directory is kept and a warning is reported.
+
 Matches are attributed to the pattern `build-artifact` in `--stats` and `--format json`.
 
 ## Dependencies
@@ -279,7 +286,9 @@ Matches are attributed to the pattern `build-artifact` in `--stats` and `--forma
 
 The marker is the lock, not the manifest: `package.json` and `pyproject.toml` carry version ranges, so only the lock names the tree the command puts back. A tree with no lock beside it is left alone. A lock reached through a symlink does not count.
 
-The built-in `.venv` exclude does not apply here: it exists to skip scanning a virtualenv, and `-D` with a `uv.lock` asks for it whole. Excludes from `--exclude` or a config file still apply.
+The built-in `.venv` exclude does not apply here: it exists to skip scanning a virtualenv, and `-D` with a `uv.lock` asks for it whole. Other excludes from `--exclude` or a config file still apply. An exclude spelt exactly like a built-in one (`**/.venv`, `**/venv`) counts as built-in, since `reclean -w` writes the built-ins into the file.
+
+As under `-B`, a tree holding files git tracks is kept. Go projects often commit `vendor/`.
 
 Two things are not preserved. Edits made inside a dependency tree are lost; patched `vendor/` source is the usual case. For Go, removing `vendor/` makes the build use the module cache or the network.
 
@@ -310,7 +319,7 @@ A target is also kept when its age cannot be shown: a timestamp in the future, a
 | 2 | Bad option or invalid configuration |
 | 3 | The run completed, but part of the tree could not be read |
 
-Status 3 is reported as a warning per path, and under `warnings` in JSON output. Matches beneath an unreadable directory are not considered.
+Status 3 is reported as a warning per path, and under `warnings` in JSON output. Matches beneath an unreadable directory are not considered. A `-B` or `-D` candidate that git cannot classify also counts.
 
 ## Safety Measures
 
@@ -344,7 +353,7 @@ This is an ordinary exclude, not protection. Three ways to clean a virtualenv an
 
 - Name it on `--path`, which exempts the root as protection does.
 
-- Pass `--no-protect`, which drops the built-in excludes along with the protected names. Excludes named in a config file or on `--exclude` are kept.
+- Pass `--no-protect`, which drops the built-in excludes along with the protected names. Other excludes named in a config file or on `--exclude` are kept.
 
 - Set `exclude_patterns` in a config file, which replaces the defaults outright.
 
@@ -356,13 +365,7 @@ This is an ordinary exclude, not protection. Three ways to clean a virtualenv an
 
 - Confirmation prompts (skippable with `-y`)
 
-- Path traversal protection via canonicalization
-
-  - All paths validated to be within the working directory
-
-  - Protects against malicious patterns like `../../etc/passwd`
-
-- Paths starting with `..` are automatically skipped
+- The walk never follows symlinks, and each directory is canonicalized and must resolve inside the working directory. Patterns only filter walked paths, so they cannot reach outside it.
 
 - Symlinks only removed with explicit `--include-symlinks` flag
 
@@ -376,7 +379,7 @@ The target itself is then confirmed to be the object the scan found, by device, 
 
 The working directory is opened by name and followed, because you named it. Entries created inside a directory while it is being emptied are removed with the rest.
 
-Elsewhere, each target's parent is canonicalized and must lie inside the working directory, and its identity is compared by file type before it is removed by path.
+Elsewhere, each target's parent is canonicalized and must lie inside the working directory, and its identity is compared by file type before it is removed by path, so a file replaced by another of the same type is not caught.
 
 ## Development
 
@@ -398,26 +401,7 @@ cargo build --release
 
 ## Testing
 
-Comprehensive test suite with 69 tests:
-- 18 integration tests (dry-run, deletion, directories, patterns, symlinks, security, age filtering, directory sizing)
-
-- 7 protected directory tests (traversal, opt-out, configurability, root exemption)
-
-- 1 relative-path traversal test
-
-- 10 duration parsing tests (all units, edge cases)
-
-- 4 default pattern and dependency table tests
-
-- 9 glob matching and TOML serialization tests
-
-- 7 config discovery tests (upward search, global fallback, edge cases)
-
-- 5 size formatting tests (B through TiB)
-
-- 2 JSON output structure tests
-
-All tests use `tempfile` for safe temporary directory creation.
+Tests use `tempfile` for temporary directories. The `-B` and `-D` tests need `git` on `PATH`.
 
 ## Links
 

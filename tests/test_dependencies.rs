@@ -190,3 +190,27 @@ fn test_json_reports_reason_type_and_restore() {
         .collect();
     assert_eq!(reasons, ["pattern", "dependency"]);
 }
+
+#[test]
+fn test_tracked_dependency_tree_is_kept() {
+    // Go projects often commit `vendor/`
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    create_tree(base, "vendor", Some("go.mod"));
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(base)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q"]);
+    git(&["add", "vendor"]);
+
+    let job = run(base, true, None);
+
+    assert_eq!(job.counter, 0);
+    assert!(base.join("vendor/pkg/index.js").exists());
+}

@@ -1,4 +1,6 @@
 
+PREFIX ?= $(HOME)/.local
+
 .PHONY: all build release test check clippy fmt lint doc clean \
 		install uninstall publish publish-dry
 
@@ -31,11 +33,11 @@ clean:
 	@rm -rf target
 
 install: release
-	@cp target/release/reclean ~/.local/bin/
+	@install -D target/release/reclean $(PREFIX)/bin/reclean
 	@echo "reclean installed"
 
 uninstall:
-	@rm -f /usr/local/bin/reclean
+	@rm -f $(PREFIX)/bin/reclean
 	@echo "reclean uninstalled"
 
 publish-dry:
