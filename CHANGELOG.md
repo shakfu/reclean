@@ -22,6 +22,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+### Fixed
+
+- On Windows, a target replaced by another object of the same type between the scan and the removal was deleted. The re-check compared only the file type. It now also compares volume serial number and file ID, read through `windows-sys`. Std exposes these only behind an unstable feature, and creation time is unreliable because of NTFS tunneling.
+
 ## [0.6.0]
 
 ### Added

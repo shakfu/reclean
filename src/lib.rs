@@ -21,6 +21,8 @@
 //! ```
 
 pub mod constants;
+#[cfg(windows)]
+mod file_id;
 #[cfg(unix)]
 mod remove;
 
@@ -522,7 +524,7 @@ pub struct MatchedItem {
 /// A matched path awaiting sizing, reporting and removal.
 struct Target {
     path: PathBuf,
-    metadata: Metadata,
+    scanned: Scanned,
     pattern: String,
     reason: Reason,
     restore: Option<&'static str>,
@@ -728,12 +730,35 @@ fn parallel_dir_sizes(
         .collect()
 }
 
-/// Whether `current` is the same filesystem object as `scanned`. Without a
-/// stable file identity in std, only the type can be compared. Unix compares
-/// device and inode in the `remove` module.
-#[cfg(not(unix))]
-fn same_object(scanned: &Metadata, current: &Metadata) -> bool {
-    scanned.file_type() == current.file_type()
+/// What the scan recorded about a target, to re-check before removal
+struct Scanned {
+    metadata: Metadata,
+    #[cfg(windows)]
+    id: file_id::FileId,
+}
+
+impl Scanned {
+    /// Record `path` without following a final symlink
+    fn of(path: &Path) -> std::io::Result<Self> {
+        Ok(Scanned {
+            metadata: fs::symlink_metadata(path)?,
+            #[cfg(windows)]
+            id: file_id::file_id(path)?,
+        })
+    }
+
+    /// Whether `current` is the same filesystem object. An ID can be reused
+    /// once freed, so the type is compared too. Elsewhere std has no stable
+    /// file identity, so only the type is compared. Unix compares device and
+    /// inode in the `remove` module.
+    #[cfg(not(unix))]
+    fn same_object(&self, current: &Scanned) -> bool {
+        let same_type = self.metadata.file_type() == current.metadata.file_type();
+        #[cfg(windows)]
+        return same_type && self.id == current.id;
+        #[cfg(not(windows))]
+        same_type
+    }
 }
 
 /// Whether `path` is build output at the top level of a project.
@@ -1058,21 +1083,21 @@ impl Scan<'_> {
     /// Record a matched entry as a target. Age is checked after sizing, since a
     /// directory's age depends on its contents.
     fn collect(&self, path: &Path, reason: Reason, restore: Option<&'static str>, pattern: String) {
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(m) => m,
+        let scanned = match Scanned::of(path) {
+            Ok(s) => s,
             Err(e) => {
                 self.skip(path, e);
                 return;
             }
         };
 
-        let is_dir = metadata.is_dir();
+        let is_dir = scanned.metadata.is_dir();
         // Directories are sized afterwards, in parallel
-        let size = if is_dir { 0 } else { metadata.len() };
+        let size = if is_dir { 0 } else { scanned.metadata.len() };
 
         self.collected.lock().unwrap().push(Target {
             path: path.to_path_buf(),
-            metadata,
+            scanned,
             // Targets no pattern matched are attributed to their reason
             pattern: if pattern.is_empty() && reason != Reason::Pattern {
                 reason.name().to_string()
@@ -1259,8 +1284,9 @@ impl CleaningJob {
         // account for and report every target
         self.size_directories(cutoff.flatten());
         if let Some(cutoff) = cutoff {
-            self.targets
-                .retain(|t| cutoff.is_some_and(|c| !t.recent && !is_recent(&t.metadata, c)));
+            self.targets.retain(|t| {
+                cutoff.is_some_and(|c| !t.recent && !is_recent(&t.scanned.metadata, c))
+            });
         }
         if let Some(limit) = larger_than {
             self.targets.retain(|t| t.size >= limit);
@@ -1468,7 +1494,7 @@ impl CleaningJob {
                     reason: target.reason,
                     kind: if target.is_dir {
                         "directory"
-                    } else if target.metadata.is_symlink() {
+                    } else if target.scanned.metadata.is_symlink() {
                         "symlink"
                     } else {
                         "file"
@@ -1540,7 +1566,7 @@ impl CleaningJob {
                         return;
                     };
                     let result = match target.path.strip_prefix(walk_root) {
-                        Ok(rel) => remove_target(base_path, rel, &target.metadata),
+                        Ok(rel) => remove_target(base_path, rel, &target.scanned),
                         Err(_) => Err("is not below the working directory".to_string()),
                     };
                     let _ = results[i].set(result);
@@ -1605,7 +1631,7 @@ impl CleaningJob {
 /// syscalls. It does not close it: the removal resolves `path` again. Unix
 /// removes through descriptors instead; see the `remove` module.
 #[cfg(not(unix))]
-fn changed_since_scan(path: &Path, scanned: &Metadata, base_path: &Path) -> Option<String> {
+fn changed_since_scan(path: &Path, scanned: &Scanned, base_path: &Path) -> Option<String> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -1618,15 +1644,16 @@ fn changed_since_scan(path: &Path, scanned: &Metadata, base_path: &Path) -> Opti
         Ok(_) => return Some("now resolves outside the working directory".to_string()),
         Err(e) => return Some(format!("cannot resolve parent: {}", e)),
     }
-    match fs::symlink_metadata(path) {
-        Ok(current) if same_object(scanned, &current) => None,
+    match Scanned::of(path) {
+        Ok(current) if scanned.same_object(&current) => None,
         Ok(_) => Some("replaced since it was scanned".to_string()),
         Err(e) => Some(format!("cannot re-check: {}", e)),
     }
 }
 
 /// Remove `rel`, a target below `root`, unless it changed since the scan
-fn remove_target(root: &Path, rel: &Path, metadata: &Metadata) -> std::result::Result<(), String> {
+fn remove_target(root: &Path, rel: &Path, scanned: &Scanned) -> std::result::Result<(), String> {
+    let metadata = &scanned.metadata;
     if !(metadata.is_dir() || metadata.is_file() || metadata.is_symlink()) {
         return Err("unsupported file type".to_string());
     }
@@ -1637,7 +1664,7 @@ fn remove_target(root: &Path, rel: &Path, metadata: &Metadata) -> std::result::R
     #[cfg(not(unix))]
     {
         let path = root.join(rel);
-        if let Some(reason) = changed_since_scan(&path, metadata, root) {
+        if let Some(reason) = changed_since_scan(&path, scanned, root) {
             return Err(reason);
         }
         let result = if metadata.is_dir() {
@@ -1719,13 +1746,13 @@ mod tests {
 
     // Elsewhere `same_object` compares only the type, so a replaced file passes
     #[test]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn replaced_file_is_not_removed() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let base = temp_dir.path().canonicalize().unwrap();
         let path = base.join("a.pyc");
         fs::write(&path, "scanned").unwrap();
-        let scanned = fs::symlink_metadata(&path).unwrap();
+        let scanned = Scanned::of(&path).unwrap();
 
         // Keep the old inode linked so the replacement cannot reuse its number
         fs::rename(&path, base.join("kept")).unwrap();
@@ -1746,7 +1773,7 @@ mod tests {
         let dir = base.join("sub");
         let target = dir.join("__pycache__");
         fs::create_dir_all(&target).unwrap();
-        let scanned = fs::symlink_metadata(&target).unwrap();
+        let scanned = Scanned::of(&target).unwrap();
 
         // An ancestor swapped for a link to a tree outside the root
         fs::remove_dir_all(&dir).unwrap();
@@ -1764,7 +1791,7 @@ mod tests {
         let base = temp_dir.path().canonicalize().unwrap();
         let path = base.join("a.pyc");
         fs::write(&path, "x").unwrap();
-        let scanned = fs::symlink_metadata(&path).unwrap();
+        let scanned = Scanned::of(&path).unwrap();
 
         assert!(remove_target(&base, Path::new("a.pyc"), &scanned).is_ok());
         assert!(!path.exists());
@@ -1776,7 +1803,7 @@ mod tests {
         let base = temp_dir.path().canonicalize().unwrap();
         let target = base.join("__pycache__");
         fs::create_dir(&target).unwrap();
-        let scanned = fs::symlink_metadata(&target).unwrap();
+        let scanned = Scanned::of(&target).unwrap();
 
         // Keep the old inode alive so the replacement cannot reuse its number
         fs::rename(&target, base.join("kept")).unwrap();
@@ -1799,7 +1826,7 @@ mod tests {
         fs::create_dir_all(target.join("deep/er")).unwrap();
         fs::write(target.join("deep/er/f"), "x").unwrap();
         fs::create_dir(target.join("sub")).unwrap();
-        let scanned = fs::symlink_metadata(&target).unwrap();
+        let scanned = Scanned::of(&target).unwrap();
 
         // A subdirectory swapped for a link to a tree outside the root
         fs::remove_dir(target.join("sub")).unwrap();
@@ -1818,7 +1845,7 @@ mod tests {
         fs::create_dir(&root).unwrap();
         let victim = base.join("victim");
         fs::write(&victim, "x").unwrap();
-        let scanned = fs::symlink_metadata(&victim).unwrap();
+        let scanned = Scanned::of(&victim).unwrap();
 
         assert!(remove_target(&root, Path::new("../victim"), &scanned).is_err());
         assert!(victim.exists());
