@@ -34,6 +34,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ### Fixed
 
+- Removal resolved each target's path again after checking it, so a directory swapped for a symlink, or replaced by another directory, between the check and the removal was still removed. On Unix, removal now walks from the root with `O_NOFOLLOW` through directory descriptors, confirms the target's device and inode on the descriptor it removes through, and empties directories through descriptors. Other platforms keep the path-based check.
+
 - On macOS the global config was read from `~/Library/Application Support/reclean/config.toml`, the platform default of `dirs::config_dir()`, not the documented `~/.config/reclean/config.toml`. macOS now reads `$XDG_CONFIG_HOME/reclean/config.toml` when that is absolute, else `~/.config/reclean/config.toml`, as Linux always did. The 0.5.0 location is still read as a fallback, with a warning naming the new one. Windows keeps `%APPDATA%`. The "no config found" error lists every location searched.
 
 ## [0.5.0]

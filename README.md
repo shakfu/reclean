@@ -366,9 +366,17 @@ This is an ordinary exclude, not protection. Three ways to clean a virtualenv an
 
 - Symlinks only removed with explicit `--include-symlinks` flag
 
-- Each target is re-checked just before removal. It must still resolve inside the working directory and be the same file (device and inode on Unix) the scan found. The window between the check and the removal is narrowed, not closed: removal resolves the path again.
-
 - Broken symlinks only removed with `--remove-broken-symlinks` flag
+
+### How removal works
+
+On Unix, removal is descriptor-relative from the working directory down. Each component of a target's path is opened with `O_NOFOLLOW` through the descriptor of the one above it, and every removal names an entry within a directory descriptor. A symlink substituted for a directory after the scan is an error rather than a way out of the tree, and a component renamed after the scan cannot be reached by name. Symlinks inside a removed directory are unlinked, never followed.
+
+The target itself is then confirmed to be the object the scan found, by device, inode and file type. A directory is checked through `fstat` on its open descriptor and emptied through that descriptor. A file or symlink is checked with `fstatat` and unlinked immediately after, which narrows the window to two adjacent syscalls rather than closing it.
+
+The working directory is opened by name and followed, because you named it. Entries created inside a directory while it is being emptied are removed with the rest.
+
+Elsewhere, each target's parent is canonicalized and must lie inside the working directory, and its identity is compared by file type before it is removed by path.
 
 ## Development
 

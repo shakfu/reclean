@@ -21,6 +21,8 @@
 //! ```
 
 pub mod constants;
+#[cfg(unix)]
+mod remove;
 
 use dialoguer::Confirm;
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
@@ -710,18 +712,9 @@ fn parallel_dir_sizes(
         .collect()
 }
 
-/// Whether `current` is the same filesystem object as `scanned`.
-#[cfg(unix)]
-fn same_object(scanned: &Metadata, current: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    // An inode number can be reused once freed, so the type is compared too
-    scanned.dev() == current.dev()
-        && scanned.ino() == current.ino()
-        && scanned.file_type() == current.file_type()
-}
-
 /// Whether `current` is the same filesystem object as `scanned`. Without a
-/// stable file identity in std, only the type can be compared.
+/// stable file identity in std, only the type can be compared. Unix compares
+/// device and inode in the `remove` module.
 #[cfg(not(unix))]
 fn same_object(scanned: &Metadata, current: &Metadata) -> bool {
     scanned.file_type() == current.file_type()
@@ -1234,7 +1227,7 @@ impl CleaningJob {
         }
 
         if !self.config.dry_run {
-            self.execute_deletion(&base_path);
+            self.execute_deletion(&base_path, path);
         }
 
         if self.has_warnings() && !self.config.json_mode {
@@ -1457,8 +1450,10 @@ impl CleaningJob {
         }
     }
 
-    /// Remove every collected target in parallel, reporting in list order
-    fn execute_deletion(&mut self, base_path: &Path) {
+    /// Remove every collected target in parallel, reporting in list order.
+    /// Target paths begin with `walk_root`, the root as the walk spelled it;
+    /// `base_path` is the same directory, canonicalized.
+    fn execute_deletion(&mut self, base_path: &Path, walk_root: &Path) {
         let targets = std::mem::take(&mut self.targets);
         let announce = self.deletes_unprompted() && !self.config.json_mode;
 
@@ -1479,8 +1474,11 @@ impl CleaningJob {
                     let Some(target) = targets.get(i) else {
                         return;
                     };
-                    let _ =
-                        results[i].set(remove_target(&target.path, &target.metadata, base_path));
+                    let result = match target.path.strip_prefix(walk_root) {
+                        Ok(rel) => remove_target(base_path, rel, &target.metadata),
+                        Err(_) => Err("is not below the working directory".to_string()),
+                    };
+                    let _ = results[i].set(result);
                 });
             }
         });
@@ -1536,7 +1534,9 @@ impl CleaningJob {
 /// or it is not the object the scan found there.
 ///
 /// This narrows the window between the scan and the removal to adjacent
-/// syscalls. It does not close it: the removal resolves `path` again.
+/// syscalls. It does not close it: the removal resolves `path` again. Unix
+/// removes through descriptors instead; see the `remove` module.
+#[cfg(not(unix))]
 fn changed_since_scan(path: &Path, scanned: &Metadata, base_path: &Path) -> Option<String> {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -1557,23 +1557,28 @@ fn changed_since_scan(path: &Path, scanned: &Metadata, base_path: &Path) -> Opti
     }
 }
 
-/// Remove one target, unless it changed since the scan
-fn remove_target(
-    path: &Path,
-    metadata: &Metadata,
-    base_path: &Path,
-) -> std::result::Result<(), String> {
-    if let Some(reason) = changed_since_scan(path, metadata, base_path) {
-        return Err(reason);
-    }
-    let result = if metadata.is_dir() {
-        fs::remove_dir_all(path)
-    } else if metadata.is_file() || metadata.is_symlink() {
-        fs::remove_file(path)
-    } else {
+/// Remove `rel`, a target below `root`, unless it changed since the scan
+fn remove_target(root: &Path, rel: &Path, metadata: &Metadata) -> std::result::Result<(), String> {
+    if !(metadata.is_dir() || metadata.is_file() || metadata.is_symlink()) {
         return Err("unsupported file type".to_string());
-    };
-    result.map_err(|e| e.to_string())
+    }
+    #[cfg(unix)]
+    {
+        remove::remove(root, rel, metadata)
+    }
+    #[cfg(not(unix))]
+    {
+        let path = root.join(rel);
+        if let Some(reason) = changed_since_scan(&path, metadata, root) {
+            return Err(reason);
+        }
+        let result = if metadata.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        result.map_err(|e| e.to_string())
+    }
 }
 
 /// Ask a yes/no question on the terminal, or read the answer from piped stdin.
@@ -1656,7 +1661,7 @@ mod tests {
         fs::rename(&path, base.join("kept")).unwrap();
         fs::write(&path, "replacement").unwrap();
 
-        assert!(remove_target(&path, &scanned, &base).is_err());
+        assert!(remove_target(&base, Path::new("a.pyc"), &scanned).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }
 
@@ -1678,7 +1683,7 @@ mod tests {
         fs::create_dir(outside.path().join("__pycache__")).unwrap();
         std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
 
-        assert!(remove_target(&target, &scanned, &base).is_err());
+        assert!(remove_target(&base, Path::new("sub/__pycache__"), &scanned).is_err());
         assert!(outside.path().join("__pycache__").exists());
         assert!(outside.path().join("precious").exists());
     }
@@ -1691,7 +1696,62 @@ mod tests {
         fs::write(&path, "x").unwrap();
         let scanned = fs::symlink_metadata(&path).unwrap();
 
-        assert!(remove_target(&path, &scanned, &base).is_ok());
+        assert!(remove_target(&base, Path::new("a.pyc"), &scanned).is_ok());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn directory_replaced_by_directory_is_not_removed() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let target = base.join("__pycache__");
+        fs::create_dir(&target).unwrap();
+        let scanned = fs::symlink_metadata(&target).unwrap();
+
+        // Keep the old inode alive so the replacement cannot reuse its number
+        fs::rename(&target, base.join("kept")).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("new"), "x").unwrap();
+
+        assert!(remove_target(&base, Path::new("__pycache__"), &scanned).is_err());
+        assert!(target.join("new").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_inside_a_target_is_unlinked_not_followed() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::write(outside.path().join("precious"), "x").unwrap();
+
+        let target = base.join("build");
+        fs::create_dir_all(target.join("deep/er")).unwrap();
+        fs::write(target.join("deep/er/f"), "x").unwrap();
+        fs::create_dir(target.join("sub")).unwrap();
+        let scanned = fs::symlink_metadata(&target).unwrap();
+
+        // A subdirectory swapped for a link to a tree outside the root
+        fs::remove_dir(target.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), target.join("sub")).unwrap();
+
+        assert_eq!(remove_target(&base, Path::new("build"), &scanned), Ok(()));
+        assert!(!target.exists());
+        assert!(outside.path().join("precious").exists());
+    }
+
+    #[test]
+    fn target_outside_the_root_is_refused() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let root = base.join("root");
+        fs::create_dir(&root).unwrap();
+        let victim = base.join("victim");
+        fs::write(&victim, "x").unwrap();
+        let scanned = fs::symlink_metadata(&victim).unwrap();
+
+        assert!(remove_target(&root, Path::new("../victim"), &scanned).is_err());
+        assert!(victim.exists());
+        assert!(remove_target(&root, Path::new(""), &scanned).is_err());
     }
 }
