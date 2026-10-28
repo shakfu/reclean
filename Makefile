@@ -33,7 +33,8 @@ clean:
 	@rm -rf target
 
 install: release
-	@install -D target/release/reclean $(PREFIX)/bin/reclean
+	@cp -a target/release/reclean $(PREFIX)/bin/reclean
+	@strip -x $(PREFIX)/bin/reclean
 	@echo "reclean installed"
 
 uninstall:

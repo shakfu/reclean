@@ -344,7 +344,21 @@ fn test_color_always_colours_piped_output_despite_no_color() {
     let err = String::from_utf8_lossy(&out.stderr);
 
     assert!(out.status.success());
-    assert!(err.contains("\x1b[32m"), "{:?}", err);
+    // Only the label is coloured, not the path and size
+    assert!(err.contains("\x1b[32mMatched\x1b[0m: "), "{:?}", err);
+}
+
+#[test]
+fn test_color_always_colours_deleted_label_bold_white() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    let out = reclean(base, &["-y", "--color", "always"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(out.status.success());
+    assert!(err.contains("\x1b[1;37mDeleted\x1b[0m: "), "{:?}", err);
 }
 
 #[test]

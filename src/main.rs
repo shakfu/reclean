@@ -122,8 +122,9 @@ enum OutputFormat {
 // main function
 
 /// Writes this crate's log records to stderr. Info lines have no prefix and
-/// are green; other levels carry a coloured `warning:`-style prefix. Colour
-/// applies only when `colour` is set.
+/// are green, except `Matched:`/`Deleted:` lines, which colour only the label;
+/// other levels carry a coloured `warning:`-style prefix. Colour applies only
+/// when `colour` is set.
 struct StderrLogger {
     colour: bool,
 }
@@ -148,9 +149,17 @@ impl log::Log for StderrLogger {
         // `eprintln!` panics when stderr is closed, which would abort a run
         // mid-report; a lost log line is the lesser failure.
         let mut err = io::stderr().lock();
-        // Info has no prefix, so the whole line takes its colour
+        // Per-target info lines colour only their label; other info lines are whole-line
         let _ = if self.colour && prefix.is_empty() {
-            writeln!(err, "\x1b[{sgr}m{}\x1b[0m", record.args())
+            let msg = record.args().to_string();
+            match [("Matched", "32"), ("Deleted", "1;37")]
+                .into_iter()
+                .find_map(|(label, sgr)| {
+                    Some((label, sgr, msg.strip_prefix(label)?.strip_prefix(':')?))
+                }) {
+                Some((label, sgr, rest)) => writeln!(err, "\x1b[{sgr}m{label}\x1b[0m:{rest}"),
+                None => writeln!(err, "\x1b[{sgr}m{msg}\x1b[0m"),
+            }
         } else if self.colour {
             writeln!(err, "\x1b[{sgr}m{prefix}\x1b[0m{}", record.args())
         } else {
