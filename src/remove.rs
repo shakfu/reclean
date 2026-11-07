@@ -23,8 +23,13 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path};
 
 /// Remove `rel`, a path below `root`, if it is still the object `scanned`
-/// describes.
-pub(crate) fn remove(root: &Path, rel: &Path, scanned: &Metadata) -> Result<(), String> {
+/// describes. `on_unlink` is called after each entry is removed.
+pub(crate) fn remove(
+    root: &Path,
+    rel: &Path,
+    scanned: &Metadata,
+    on_unlink: &dyn Fn(),
+) -> Result<(), String> {
     let mut names = Vec::new();
     for component in rel.components() {
         match component {
@@ -53,9 +58,9 @@ pub(crate) fn remove(root: &Path, rel: &Path, scanned: &Metadata) -> Result<(), 
         ) {
             return Err(replaced());
         }
-        empty(&target).map_err(|e| e.to_string())?;
+        empty(&target, on_unlink).map_err(|e| e.to_string())?;
         drop(target);
-        unlink(dir.as_raw_fd(), last, libc::AT_REMOVEDIR).map_err(|e| e.to_string())
+        unlink(dir.as_raw_fd(), last, libc::AT_REMOVEDIR).map_err(|e| e.to_string())?;
     } else {
         if !same_object(
             scanned,
@@ -63,13 +68,15 @@ pub(crate) fn remove(root: &Path, rel: &Path, scanned: &Metadata) -> Result<(), 
         ) {
             return Err(replaced());
         }
-        unlink(dir.as_raw_fd(), last, 0).map_err(|e| e.to_string())
+        unlink(dir.as_raw_fd(), last, 0).map_err(|e| e.to_string())?;
     }
+    on_unlink();
+    Ok(())
 }
 
 /// Remove everything inside the directory open as `dir`, without following
 /// any symlink in it.
-fn empty(dir: &OwnedFd) -> io::Result<()> {
+fn empty(dir: &OwnedFd, on_unlink: &dyn Fn()) -> io::Result<()> {
     // Names are read in full before any is removed: removing entries while a
     // directory stream is open can make it skip others.
     for (name, kind) in entries(dir)? {
@@ -80,12 +87,13 @@ fn empty(dir: &OwnedFd) -> io::Result<()> {
         };
         if is_dir {
             let child = open_dir(dir.as_raw_fd(), &name, false)?;
-            empty(&child)?;
+            empty(&child, on_unlink)?;
             drop(child);
             unlink(dir.as_raw_fd(), &name, libc::AT_REMOVEDIR)?;
         } else {
             unlink(dir.as_raw_fd(), &name, 0)?;
         }
+        on_unlink();
     }
     Ok(())
 }

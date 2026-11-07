@@ -26,6 +26,7 @@ mod file_id;
 #[cfg(unix)]
 mod remove;
 
+use dialoguer::console::style;
 use dialoguer::Confirm;
 use globset::{Glob, GlobMatcher, GlobSet, GlobSetBuilder};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -529,6 +530,8 @@ struct Target {
     reason: Reason,
     restore: Option<&'static str>,
     size: u64,
+    /// Entries below a directory, which removal unlinks one by one
+    entries: u64,
     is_dir: bool,
     /// Whether a directory holds an entry newer than the `older_than_secs` cutoff
     recent: bool,
@@ -618,6 +621,11 @@ where
     });
 }
 
+/// Log target of the report: matched targets, totals, statistics and deletions.
+/// The CLI writes it to stdout and every other record to stderr. Its spans are
+/// styled for stdout.
+pub const REPORT_TARGET: &str = "reclean::report";
+
 /// Paths that could not be read, with the reason.
 type Warnings = Mutex<Vec<(PathBuf, String)>>;
 
@@ -636,8 +644,8 @@ fn record(warnings: &Warnings, path: &Path, reason: impl std::fmt::Display) {
         .push((path.to_path_buf(), reason.to_string()));
 }
 
-/// Total the sizes of every regular file under each directory in `dirs`, and
-/// report whether each holds an entry modified after `cutoff`.
+/// Total the sizes of every regular file under each directory in `dirs`, count
+/// its entries, and report whether each holds an entry modified after `cutoff`.
 ///
 /// Symlinks are counted at their own size and never followed, matching what
 /// `remove_dir_all` will actually delete and ruling out a symlink cycle walking
@@ -647,12 +655,18 @@ fn parallel_dir_sizes(
     dirs: &[PathBuf],
     cutoff: Option<SystemTime>,
     warnings: &Warnings,
-) -> Vec<(u64, bool)> {
+    progress: &ProgressBar,
+) -> Vec<(u64, u64, bool)> {
     if dirs.is_empty() {
         return Vec::new();
     }
+    let record = |warnings: &Warnings, path: &Path, reason: std::io::Error| {
+        progress.suspend(|| record(warnings, path, reason))
+    };
+    let sized = AtomicU64::new(0);
 
     let totals: Vec<AtomicU64> = dirs.iter().map(|_| AtomicU64::new(0)).collect();
+    let counts: Vec<AtomicU64> = dirs.iter().map(|_| AtomicU64::new(0)).collect();
     let recent: Vec<AtomicBool> = dirs.iter().map(|_| AtomicBool::new(false)).collect();
 
     // Each work item carries the index of the matched directory it belongs to
@@ -663,7 +677,12 @@ fn parallel_dir_sizes(
             if cutoff.is_some() && recent[owner].load(Ordering::Relaxed) {
                 return Vec::new();
             }
+            let done = sized.fetch_add(1, Ordering::Relaxed) + 1;
+            if done.is_multiple_of(64) {
+                progress.set_message(format!("sizing {done}"));
+            }
             let mut bytes = 0u64;
+            let mut count = 0u64;
             let mut is_recent_here = false;
             let mut subdirs = Vec::new();
             match fs::read_dir(&dir) {
@@ -677,6 +696,7 @@ fn parallel_dir_sizes(
                                 continue;
                             }
                         };
+                        count += 1;
                         let is_dir = match entry.file_type() {
                             Ok(ty) => ty.is_dir(),
                             Err(e) => {
@@ -716,6 +736,7 @@ fn parallel_dir_sizes(
             if bytes > 0 {
                 totals[owner].fetch_add(bytes, Ordering::Relaxed);
             }
+            counts[owner].fetch_add(count, Ordering::Relaxed);
             if is_recent_here {
                 recent[owner].store(true, Ordering::Relaxed);
             }
@@ -725,8 +746,9 @@ fn parallel_dir_sizes(
 
     totals
         .into_iter()
+        .zip(counts)
         .zip(recent)
-        .map(|(t, r)| (t.into_inner(), r.into_inner()))
+        .map(|((t, c), r)| (t.into_inner(), c.into_inner(), r.into_inner()))
         .collect()
 }
 
@@ -882,34 +904,23 @@ struct Scan<'a> {
     /// The built-in excludes, which do not apply to a dependency tree
     default_exclude_set: &'a Option<GlobSet>,
     matchers: &'a [(String, GlobMatcher)],
-    progress: Option<ProgressBar>,
+    /// Hidden when progress is off, so warnings print through it either way
+    progress: ProgressBar,
     processed: AtomicU64,
     collected: Mutex<Vec<Target>>,
     warnings: Warnings,
 }
 
 impl Scan<'_> {
-    /// Record a path the walk could not read, through the progress bar when one is drawn
+    /// Record a path the walk could not read
     fn skip(&self, path: &Path, reason: impl std::fmt::Display) {
-        match self.progress {
-            Some(ref pb) => {
-                pb.println(format!("Cannot read {:?}: {}", path.display(), reason));
-                self.warnings
-                    .lock()
-                    .unwrap()
-                    .push((path.to_path_buf(), reason.to_string()));
-            }
-            None => record(&self.warnings, path, reason),
-        }
+        self.progress
+            .suspend(|| record(&self.warnings, path, reason));
     }
 
-    /// Report a line, through the progress bar when one is drawn
+    /// Report a line
     fn note(&self, msg: String) {
-        if let Some(ref pb) = self.progress {
-            pb.println(&msg);
-        } else {
-            info!("{}", msg);
-        }
+        self.progress.suspend(|| info!("{}", msg));
     }
 
     /// Whether `path` holds files git tracks, which makes it source whatever its
@@ -984,14 +995,8 @@ impl Scan<'_> {
     /// descend into it.
     fn consider(&self, path: &Path, name: &OsStr, file_type: fs::FileType) -> bool {
         let processed = self.processed.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(ref pb) = self.progress {
-            if processed.is_multiple_of(100) {
-                pb.set_message(format!(
-                    "Scanned {} items, found {} matches",
-                    processed,
-                    self.collected.lock().unwrap().len()
-                ));
-            }
+        if processed.is_multiple_of(256) {
+            self.progress.set_message(format!("scanning {processed}"));
         }
 
         // Protected names are neither matched nor entered
@@ -1108,6 +1113,7 @@ impl Scan<'_> {
             restore,
             size,
             is_dir,
+            entries: 0,
             recent: false,
         });
     }
@@ -1245,11 +1251,6 @@ impl CleaningJob {
         serde_json::to_string_pretty(&output)
     }
 
-    /// Whether targets are removed without asking first.
-    fn deletes_unprompted(&self) -> bool {
-        self.config.skip_confirmation && !self.config.dry_run
-    }
-
     /// Run the cleaning job. Results from an earlier run are discarded.
     pub fn run(&mut self) -> Result<()> {
         *self = Self::new(std::mem::take(&mut self.config));
@@ -1269,8 +1270,26 @@ impl CleaningJob {
         // Build globsets
         let (include_set, excludes, matchers) = self.build_globsets()?;
 
+        // One line on stderr, rewritten in place, so a large tree does not look
+        // like a hang. Indicatif hides it when stderr is not a terminal.
+        let progress = if self.config.show_progress {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+            pb.set_message("scanning");
+            pb
+        } else {
+            ProgressBar::hidden()
+        };
+
         // Collect targets
-        self.collect_targets(path, &base_path, &include_set, &excludes, &matchers)?;
+        self.collect_targets(
+            path,
+            &base_path,
+            &include_set,
+            &excludes,
+            &matchers,
+            &progress,
+        )?;
 
         // Size is known only after sizing, so this filter follows it
         let larger_than = self.config.larger_than_bytes;
@@ -1282,7 +1301,8 @@ impl CleaningJob {
 
         // Size matched directories, drop targets that are too recent, then
         // account for and report every target
-        self.size_directories(cutoff.flatten());
+        self.size_directories(cutoff.flatten(), &progress);
+        progress.finish_and_clear();
         if let Some(cutoff) = cutoff {
             self.targets.retain(|t| {
                 cutoff.is_some_and(|c| !t.recent && !is_recent(&t.scanned.metadata, c))
@@ -1362,22 +1382,8 @@ impl CleaningJob {
         include_set: &GlobSet,
         excludes: &Excludes,
         matchers: &[(String, GlobMatcher)],
+        progress: &ProgressBar,
     ) -> Result<()> {
-        // Create progress bar if requested
-        let progress = if self.config.show_progress {
-            let pb = ProgressBar::new_spinner();
-            pb.set_style(
-                ProgressStyle::default_spinner()
-                    .template("{spinner:.green} [{elapsed_precise}] {msg}")
-                    .unwrap(),
-            );
-            pb.set_message("Scanning files...");
-            pb.enable_steady_tick(Duration::from_millis(100));
-            Some(pb)
-        } else {
-            None
-        };
-
         let scan = Scan {
             config: &self.config,
             base_path,
@@ -1386,7 +1392,7 @@ impl CleaningJob {
             exclude_set: &excludes.0,
             default_exclude_set: &excludes.1,
             matchers,
-            progress,
+            progress: progress.clone(),
             processed: AtomicU64::new(0),
             collected: Mutex::new(Vec::new()),
             warnings: Mutex::new(Vec::new()),
@@ -1417,8 +1423,6 @@ impl CleaningJob {
         }
 
         let Scan {
-            progress,
-            processed,
             collected,
             warnings,
             ..
@@ -1430,20 +1434,11 @@ impl CleaningJob {
         // reproducible and the pre-confirmation output readable.
         self.targets.sort_by(|a, b| a.path.cmp(&b.path));
 
-        // Finish progress bar
-        if let Some(pb) = progress {
-            pb.finish_with_message(format!(
-                "Scan complete: {} items scanned, {} matches found",
-                processed.into_inner(),
-                self.targets.len()
-            ));
-        }
-
         Ok(())
     }
 
     /// Fill in the size of every matched directory
-    fn size_directories(&mut self, cutoff: Option<SystemTime>) {
+    fn size_directories(&mut self, cutoff: Option<SystemTime>, progress: &ProgressBar) {
         let indices: Vec<usize> = self
             .targets
             .iter()
@@ -1458,19 +1453,35 @@ impl CleaningJob {
             .collect();
 
         let warnings = Mutex::new(Vec::new());
-        let sized = parallel_dir_sizes(&dirs, cutoff, &warnings);
-        for (&index, (size, recent)) in indices.iter().zip(sized) {
+        let sized = parallel_dir_sizes(&dirs, cutoff, &warnings, progress);
+        for (&index, (size, entries, recent)) in indices.iter().zip(sized) {
             self.targets[index].size = size;
+            self.targets[index].entries = entries;
             self.targets[index].recent = recent;
         }
         self.warnings.append(&mut warnings.into_inner().unwrap());
     }
 
+    /// A target's path as the report prints it: relative to the root and
+    /// escaped, with a trailing `/` and cyan for a directory
+    fn styled_path(&self, target: &Target) -> dialoguer::console::StyledObject<String> {
+        let path = target
+            .path
+            .strip_prefix(&self.config.path)
+            .unwrap_or(&target.path);
+        if target.is_dir {
+            style(format!("{}/", escaped(path))).cyan().for_stdout()
+        } else {
+            style(escaped(path)).for_stdout()
+        }
+    }
+
     /// Accumulate totals, statistics and per-item output for the collected targets
     fn report_targets(&mut self) {
-        // Targets deleted without a prompt are reported by `execute_deletion` instead,
-        // so a run does not list the same path twice.
-        let announce = !self.deletes_unprompted() && !self.config.json_mode;
+        let announce = !self.config.json_mode && !self.targets.is_empty();
+        if announce {
+            info!(target: REPORT_TARGET, "\nMatched targets:");
+        }
 
         for target in self.targets.iter() {
             self.size += target.size;
@@ -1504,39 +1515,48 @@ impl CleaningJob {
             }
 
             if announce {
-                match target.restore {
-                    Some(restore) => info!(
-                        "Matched: {:?}  {}  (restore: {})",
-                        target.path.display(),
-                        format_size(target.size),
-                        restore
-                    ),
-                    None => info!(
-                        "Matched: {:?}  {}",
-                        target.path.display(),
-                        format_size(target.size)
-                    ),
-                }
+                let size = style(format!("  {}", format_size(target.size)))
+                    .dim()
+                    .for_stdout();
+                // The one question worth answering before removing a tree only
+                // the network can rebuild
+                let restore = target
+                    .restore
+                    .map(|r| {
+                        style(format!("  restore: {r}"))
+                            .dim()
+                            .for_stdout()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
+                info!(target: REPORT_TARGET,
+                    "  {}{}{}",
+                    self.styled_path(target),
+                    size,
+                    restore
+                );
             }
         }
 
         if self.config.json_mode || self.counter == 0 {
             return;
         }
-        info!(
-            "{} target(s), {} to reclaim",
-            self.counter,
-            format_size(self.size)
+        info!(target: REPORT_TARGET,
+            "\n{} {}, {} to reclaim",
+            style(self.counter).bold().for_stdout(),
+            if self.counter == 1 { "target" } else { "targets" },
+            style(format_size(self.size)).bold().for_stdout()
         );
         // One reason would repeat the total
         if self.reasons.len() > 1 {
             for (reason, (count, size)) in &self.reasons {
-                info!(
+                let row = format!(
                     "  {:<16}{:>6}  {:>12}",
                     reason.name(),
                     count,
                     format_size(*size)
                 );
+                info!(target: REPORT_TARGET, "{}", style(row).dim().for_stdout());
             }
         }
     }
@@ -1546,13 +1566,28 @@ impl CleaningJob {
     /// `base_path` is the same directory, canonicalized.
     fn execute_deletion(&mut self, base_path: &Path, walk_root: &Path) {
         let targets = std::mem::take(&mut self.targets);
-        let announce = self.deletes_unprompted() && !self.config.json_mode;
 
         // No target can sit inside another: the walk stops descending at a matched
         // directory, so a child of one is never collected. Removals therefore
         // never race each other down one subtree.
         let results: Vec<OnceLock<std::result::Result<(), String>>> =
             targets.iter().map(|_| OnceLock::new()).collect();
+        // Counted in entries, which the sizing pass already listed, rather than
+        // bytes: a byte count would need a stat per file before each unlink.
+        let total: u64 = targets.iter().map(|t| t.entries + 1).sum();
+        let progress = if self.config.show_progress {
+            let pb = ProgressBar::new(total);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "  removing [{bar:30}] {percent:>3}%  {pos} / {len} entries",
+                )
+                .unwrap()
+                .progress_chars("#-"),
+            );
+            pb
+        } else {
+            ProgressBar::hidden()
+        };
         let next = AtomicUsize::new(0);
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -1566,22 +1601,30 @@ impl CleaningJob {
                         return;
                     };
                     let result = match target.path.strip_prefix(walk_root) {
-                        Ok(rel) => remove_target(base_path, rel, &target.scanned),
+                        Ok(rel) => {
+                            remove_target(base_path, rel, &target.scanned, target.entries, &|| {
+                                progress.inc(1)
+                            })
+                        }
                         Err(_) => Err("is not below the working directory".to_string()),
                     };
                     let _ = results[i].set(result);
                 });
             }
         });
+        progress.finish_and_clear();
 
         for (target, result) in targets.iter().zip(results) {
             match result.into_inner() {
                 Some(Ok(())) => {
                     self.removed_count += 1;
                     self.removed_size += target.size;
-                    if announce {
-                        info!("Deleted: {:?}", target.path.display());
-                    }
+                    // The list was shown before removal, so only `-v` repeats it
+                    debug!(target: REPORT_TARGET,
+                        "  {}  {}",
+                        style("removed").dim().for_stdout(),
+                        self.styled_path(target)
+                    );
                 }
                 Some(Err(e)) => {
                     error!("Failed to remove {:?}: {}", target.path.display(), e);
@@ -1592,11 +1635,13 @@ impl CleaningJob {
         }
 
         if !self.config.json_mode && self.removed_count > 0 {
-            info!(
-                "Deleted {} item(s) totalling {}",
-                self.removed_count,
-                format_size(self.removed_size)
-            );
+            let count = style(format!("Deleted {} item(s)", self.removed_count)).for_stdout();
+            let count = if self.failed_deletions.is_empty() {
+                count.green()
+            } else {
+                count
+            };
+            info!(target: REPORT_TARGET, "{} totalling {}", count, format_size(self.removed_size));
         }
         if !self.failed_deletions.is_empty() {
             error!("{} removal(s) failed", self.failed_deletions.len());
@@ -1616,11 +1661,11 @@ impl CleaningJob {
             return;
         }
 
-        info!("\n=== Statistics ===");
+        info!(target: REPORT_TARGET, "\n=== Statistics ===");
         for (pattern, (count, size)) in self.sorted_stats() {
-            info!("  {}: {} item(s), {}", pattern, count, format_size(*size));
+            info!(target: REPORT_TARGET, "  {}: {} item(s), {}", pattern, count, format_size(*size));
         }
-        info!("==================\n");
+        info!(target: REPORT_TARGET, "==================\n");
     }
 }
 
@@ -1652,14 +1697,23 @@ fn changed_since_scan(path: &Path, scanned: &Scanned, base_path: &Path) -> Optio
 }
 
 /// Remove `rel`, a target below `root`, unless it changed since the scan
-fn remove_target(root: &Path, rel: &Path, scanned: &Scanned) -> std::result::Result<(), String> {
+/// `on_unlink` is called once per entry removed, the target itself included;
+/// `entries` is how many the scan counted below it.
+fn remove_target(
+    root: &Path,
+    rel: &Path,
+    scanned: &Scanned,
+    // Unix removal reports each entry itself
+    #[cfg_attr(unix, allow(unused_variables))] entries: u64,
+    on_unlink: &dyn Fn(),
+) -> std::result::Result<(), String> {
     let metadata = &scanned.metadata;
     if !(metadata.is_dir() || metadata.is_file() || metadata.is_symlink()) {
         return Err("unsupported file type".to_string());
     }
     #[cfg(unix)]
     {
-        remove::remove(root, rel, metadata)
+        remove::remove(root, rel, metadata, on_unlink)
     }
     #[cfg(not(unix))]
     {
@@ -1672,8 +1726,29 @@ fn remove_target(root: &Path, rel: &Path, scanned: &Scanned) -> std::result::Res
         } else {
             fs::remove_file(&path)
         };
+        // `remove_dir_all` reports nothing per entry, so the target advances at once
+        if result.is_ok() {
+            for _ in 0..=entries {
+                on_unlink();
+            }
+        }
         result.map_err(|e| e.to_string())
     }
+}
+
+/// `path` with control characters escaped, so a file name cannot move the
+/// cursor or recolour the terminal it is printed to. A backslash is escaped
+/// too, except on Windows, where it is the separator and cannot be in a name.
+fn escaped(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '\\' if cfg!(not(windows)) => out.push_str("\\\\"),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Ask a yes/no question on the terminal, or read the answer from piped stdin.
@@ -1758,7 +1833,7 @@ mod tests {
         fs::rename(&path, base.join("kept")).unwrap();
         fs::write(&path, "replacement").unwrap();
 
-        assert!(remove_target(&base, Path::new("a.pyc"), &scanned).is_err());
+        assert!(remove_target(&base, Path::new("a.pyc"), &scanned, 0, &|| {}).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "replacement");
     }
 
@@ -1780,7 +1855,7 @@ mod tests {
         fs::create_dir(outside.path().join("__pycache__")).unwrap();
         std::os::unix::fs::symlink(outside.path(), &dir).unwrap();
 
-        assert!(remove_target(&base, Path::new("sub/__pycache__"), &scanned).is_err());
+        assert!(remove_target(&base, Path::new("sub/__pycache__"), &scanned, 0, &|| {}).is_err());
         assert!(outside.path().join("__pycache__").exists());
         assert!(outside.path().join("precious").exists());
     }
@@ -1793,7 +1868,7 @@ mod tests {
         fs::write(&path, "x").unwrap();
         let scanned = Scanned::of(&path).unwrap();
 
-        assert!(remove_target(&base, Path::new("a.pyc"), &scanned).is_ok());
+        assert!(remove_target(&base, Path::new("a.pyc"), &scanned, 0, &|| {}).is_ok());
         assert!(!path.exists());
     }
 
@@ -1810,7 +1885,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("new"), "x").unwrap();
 
-        assert!(remove_target(&base, Path::new("__pycache__"), &scanned).is_err());
+        assert!(remove_target(&base, Path::new("__pycache__"), &scanned, 0, &|| {}).is_err());
         assert!(target.join("new").exists());
     }
 
@@ -1832,9 +1907,42 @@ mod tests {
         fs::remove_dir(target.join("sub")).unwrap();
         std::os::unix::fs::symlink(outside.path(), target.join("sub")).unwrap();
 
-        assert_eq!(remove_target(&base, Path::new("build"), &scanned), Ok(()));
+        assert_eq!(
+            remove_target(&base, Path::new("build"), &scanned, 0, &|| {}),
+            Ok(())
+        );
         assert!(!target.exists());
         assert!(outside.path().join("precious").exists());
+    }
+
+    #[test]
+    fn removal_reports_every_entry_the_sizing_pass_counted() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let target = base.join("build");
+        fs::create_dir_all(target.join("deep/er")).unwrap();
+        fs::write(target.join("deep/er/f"), "x").unwrap();
+        fs::write(target.join("g"), "x").unwrap();
+        let scanned = Scanned::of(&target).unwrap();
+
+        let warnings = Mutex::new(Vec::new());
+        let sized = parallel_dir_sizes(
+            std::slice::from_ref(&target),
+            None,
+            &warnings,
+            &ProgressBar::hidden(),
+        );
+        // deep, deep/er, deep/er/f, g
+        assert_eq!(sized[0].1, 4);
+
+        let unlinked = AtomicU64::new(0);
+        let on_unlink = || {
+            unlinked.fetch_add(1, Ordering::Relaxed);
+        };
+        let result = remove_target(&base, Path::new("build"), &scanned, 4, &on_unlink);
+        assert_eq!(result, Ok(()));
+        // The entries, then the target itself
+        assert_eq!(unlinked.into_inner(), 5);
     }
 
     #[test]
@@ -1847,8 +1955,8 @@ mod tests {
         fs::write(&victim, "x").unwrap();
         let scanned = Scanned::of(&victim).unwrap();
 
-        assert!(remove_target(&root, Path::new("../victim"), &scanned).is_err());
+        assert!(remove_target(&root, Path::new("../victim"), &scanned, 0, &|| {}).is_err());
         assert!(victim.exists());
-        assert!(remove_target(&root, Path::new(""), &scanned).is_err());
+        assert!(remove_target(&root, Path::new(""), &scanned, 0, &|| {}).is_err());
     }
 }

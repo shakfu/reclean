@@ -22,6 +22,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ## [Unreleased]
 
+### Added
+
+- A progress bar while deleting, on stderr for a terminal only. A large `target/` or `node_modules` previously went silent between the prompt and the summary. The bar counts entries rather than bytes. The sizing pass already lists every entry, while a byte count would need a stat per file before each unlink. On Windows, `remove_dir_all` reports nothing per entry, so the bar advances one whole target at a time.
+
+### Changed
+
+- The report goes to stdout, as in cclean: matched targets, totals, statistics and deletions. Warnings, errors, notes, progress and the prompt stay on stderr. `reclean > list.txt` now captures the list, and `2>/dev/null` no longer hides it. The library still prints nothing itself. It logs report lines under the new `reclean::REPORT_TARGET`, and the CLI logger routes that target to stdout. `--color` is decided per stream.
+
+- The matched list follows cclean's format. It prints a `Matched targets:` header, then one line per target: the path relative to the root, the size, and the restore command. A directory ends in `/`, so its type shows without colour. Paths are printed bare rather than in `{:?}` quotes. Control characters, and backslashes outside Windows, are escaped, so a file name cannot write escape sequences to the terminal. The total reads `1 target` / `N targets`.
+
+- `-y` lists targets like any other run. It no longer prints one `Deleted:` line per target after removal; `-v` prints `removed <path>` for each. Failures are still named on stderr.
+
+- Report colour follows cclean: plain text, with directories cyan, sizes and restore hints dim, totals bold, and the deletion summary green. Warnings are yellow and errors red, no longer bold. Since 0.6.0 every info line was green, which left nothing for emphasis to mark.
+
+- A scan shows its progress whenever stderr is a terminal, as one `scanning N` or `sizing N` line that is cleared when the scan ends. It was opt-in through `-P`, so a large tree looked like a hang by default. `-P` is still accepted but hidden, and `-q` turns the line off. The CLI now ignores `show_progress` in a config file: files written by `-w` before this release set it to `false`. Warnings during a scan now go through the logger with their `warning:` prefix rather than around it.
+
 ### Fixed
 
 - On Windows, a target replaced by another object of the same type between the scan and the removal was deleted. The re-check compared only the file type. It now also compares volume serial number and file ID, read through `windows-sys`. Std exposes these only behind an unstable feature, and creation time is unreliable because of NTFS tunneling.

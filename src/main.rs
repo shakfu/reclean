@@ -79,8 +79,8 @@ struct Args {
     #[arg(long, value_name = "SIZE")]
     larger_than: Option<String>,
 
-    /// Show progress bar during scanning
-    #[arg(short = 'P', long)]
+    /// Accepted for compatibility: progress now shows whenever stderr is a terminal
+    #[arg(short = 'P', long, hide = true)]
     progress: bool,
 
     /// Match inside protected (.git, .ssh, ...) and excluded-by-default (.venv) directories
@@ -103,7 +103,7 @@ struct Args {
     #[arg(long, default_value = "text")]
     format: OutputFormat,
 
-    /// When to colour stderr output (auto: on a terminal, unless NO_COLOR is set)
+    /// When to colour output (auto: on a terminal, unless NO_COLOR is set)
     #[arg(long, value_name = "WHEN", default_value = "auto")]
     color: clap::ColorChoice,
 
@@ -121,10 +121,9 @@ enum OutputFormat {
 // --------------------------------------------------------------------
 // main function
 
-/// Writes this crate's log records to stderr. Info lines have no prefix and
-/// are green, except `Matched:`/`Deleted:` lines, which colour only the label;
-/// other levels carry a coloured `warning:`-style prefix. Colour applies only
-/// when `colour` is set.
+/// Writes the report ([`reclean::REPORT_TARGET`]) to stdout as the library
+/// styled it, and every other record of this crate to stderr. Levels other than
+/// info carry a `warning:`-style prefix, coloured only when `colour` is set.
 struct StderrLogger {
     colour: bool,
 }
@@ -140,27 +139,20 @@ impl log::Log for StderrLogger {
             return;
         }
         let (prefix, sgr) = match record.level() {
-            log::Level::Info => ("", "32"),
-            log::Level::Error => ("error: ", "1;31"),
-            log::Level::Warn => ("warning: ", "1;33"),
-            log::Level::Debug => ("debug: ", "36"),
-            log::Level::Trace => ("trace: ", "35"),
+            log::Level::Info => ("", ""),
+            log::Level::Error => ("error: ", "31"),
+            log::Level::Warn => ("warning: ", "33"),
+            log::Level::Debug => ("debug: ", "2"),
+            log::Level::Trace => ("trace: ", "2"),
         };
-        // `eprintln!` panics when stderr is closed, which would abort a run
-        // mid-report; a lost log line is the lesser failure.
+        // `println!` and `eprintln!` panic when the stream is closed, which would
+        // abort a run mid-report; a lost line is the lesser failure.
+        if record.target() == reclean::REPORT_TARGET {
+            let _ = writeln!(io::stdout().lock(), "{}", record.args());
+            return;
+        }
         let mut err = io::stderr().lock();
-        // Per-target info lines colour only their label; other info lines are whole-line
-        let _ = if self.colour && prefix.is_empty() {
-            let msg = record.args().to_string();
-            match [("Matched", "32"), ("Deleted", "1;37")]
-                .into_iter()
-                .find_map(|(label, sgr)| {
-                    Some((label, sgr, msg.strip_prefix(label)?.strip_prefix(':')?))
-                }) {
-                Some((label, sgr, rest)) => writeln!(err, "\x1b[{sgr}m{label}\x1b[0m:{rest}"),
-                None => writeln!(err, "\x1b[{sgr}m{msg}\x1b[0m"),
-            }
-        } else if self.colour {
+        let _ = if self.colour && !prefix.is_empty() {
             writeln!(err, "\x1b[{sgr}m{prefix}\x1b[0m{}", record.args())
         } else {
             writeln!(err, "{prefix}{}", record.args())
@@ -170,14 +162,14 @@ impl log::Log for StderrLogger {
     fn flush(&self) {}
 }
 
-/// Resolve `--color`. `auto` colours only a terminal, and never when `NO_COLOR`
-/// is set to a non-empty value; `always` overrides `NO_COLOR`.
-fn colour_enabled(choice: clap::ColorChoice) -> bool {
+/// Resolve `--color` for a stream. `auto` colours only a terminal, and never
+/// when `NO_COLOR` is set to a non-empty value; `always` overrides `NO_COLOR`.
+fn colour_enabled(choice: clap::ColorChoice, stream: &impl IsTerminal) -> bool {
     match choice {
         clap::ColorChoice::Always => true,
         clap::ColorChoice::Never => false,
         clap::ColorChoice::Auto => {
-            io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+            stream.is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
         }
     }
 }
@@ -304,9 +296,7 @@ fn run_job_from_configfile(config_path: Option<String>, args: &Args) -> Result<i
     if args.stats {
         config.stats_mode = true;
     }
-    if args.progress {
-        config.show_progress = true;
-    }
+    config.show_progress = !args.quiet;
     if args.build_artifacts {
         config.build_artifacts = true;
     }
@@ -403,7 +393,7 @@ fn run(args: Args) -> Result<i32> {
         .remove_broken_symlinks(args.remove_broken_symlinks)
         .stats_mode(args.stats)
         .older_than_secs(older_than_secs)
-        .show_progress(args.progress)
+        .show_progress(!args.quiet)
         .json_mode(args.format == OutputFormat::Json)
         .build_artifacts(args.build_artifacts)
         .dependencies(args.dependencies)
@@ -438,9 +428,10 @@ fn main() {
     } else {
         log::LevelFilter::Info
     };
-    let colour = colour_enabled(args.color);
-    // The progress spinner and confirmation prompt colour through `console`,
-    // which ignores `NO_COLOR` unless told otherwise
+    // Report spans, the progress line and the confirmation prompt colour
+    // through `console`, which ignores `NO_COLOR` unless told otherwise
+    let colour = colour_enabled(args.color, &io::stderr());
+    dialoguer::console::set_colors_enabled(colour_enabled(args.color, &io::stdout()));
     dialoguer::console::set_colors_enabled_stderr(colour);
     init_logging(log_level, colour);
 

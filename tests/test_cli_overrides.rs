@@ -248,14 +248,18 @@ fn test_matched_list_shows_sizes_total_and_restore() {
     fs::write(base.join("package-lock.json"), "").unwrap();
 
     let out = reclean(base, &["-d", "-D", "-g", "**/*.pyc"]);
-    let err = String::from_utf8_lossy(&out.stderr);
+    let report = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success());
-    assert!(err.contains("2.00 KiB"), "{}", err);
-    assert!(err.contains("(restore: npm ci)"), "{}", err);
-    assert!(err.contains("2 target(s)"), "{}", err);
+    assert!(report.contains("2.00 KiB"), "{}", report);
+    assert!(
+        report.contains("  node_modules/  ") && report.contains("  restore: npm ci"),
+        "{}",
+        report
+    );
+    assert!(report.contains("2 targets, "), "{}", report);
     // Two reasons, so a breakdown follows the total
-    assert!(err.contains("dependency"), "{}", err);
+    assert!(report.contains("dependency"), "{}", report);
 }
 
 #[test]
@@ -274,8 +278,8 @@ fn test_many_targets_are_all_removed() {
     for i in 0..200 {
         assert!(!base.join(format!("p{}", i)).join("__pycache__").exists());
     }
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("Deleted 200 item(s)"), "{}", err);
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(report.contains("Deleted 200 item(s)"), "{}", report);
 }
 
 #[test]
@@ -334,6 +338,7 @@ fn test_color_always_colours_piped_output_despite_no_color() {
     let temp_dir = TempDir::new().unwrap();
     let base = temp_dir.path();
     fs::write(base.join("a.pyc"), "").unwrap();
+    fs::create_dir(base.join("__pycache__")).unwrap();
 
     let out = Command::new(env!("CARGO_BIN_EXE_reclean"))
         .current_dir(base)
@@ -341,24 +346,60 @@ fn test_color_always_colours_piped_output_despite_no_color() {
         .env("NO_COLOR", "1")
         .output()
         .unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let report = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success());
-    // Only the label is coloured, not the path and size
-    assert!(err.contains("\x1b[32mMatched\x1b[0m: "), "{:?}", err);
+    // File paths are plain; directories are cyan with a `/`, sizes dim, totals bold
+    assert!(
+        report.contains("\n  a.pyc\x1b[2m  0 B\x1b[0m\n"),
+        "{:?}",
+        report
+    );
+    assert!(
+        report.contains("\n  \x1b[36m__pycache__/\x1b[0m\x1b[2m  0 B\x1b[0m\n"),
+        "{:?}",
+        report
+    );
+    assert!(report.contains("\x1b[1m2\x1b[0m targets, "), "{:?}", report);
 }
 
 #[test]
-fn test_color_always_colours_deleted_label_bold_white() {
+fn test_color_always_colours_deleted_summary_green() {
     let temp_dir = TempDir::new().unwrap();
     let base = temp_dir.path();
     fs::write(base.join("a.pyc"), "").unwrap();
 
     let out = reclean(base, &["-y", "--color", "always"]);
-    let err = String::from_utf8_lossy(&out.stderr);
+    let report = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success());
-    assert!(err.contains("\x1b[1;37mDeleted\x1b[0m: "), "{:?}", err);
+    // The list is shown before removal, and not repeated after it
+    assert!(report.contains("Matched targets:\n  a.pyc"), "{:?}", report);
+    assert!(!report.contains("removed"), "{:?}", report);
+    assert!(
+        report.contains("\x1b[32mDeleted 1 item(s)\x1b[0m totalling"),
+        "{:?}",
+        report
+    );
+}
+
+#[test]
+fn test_progress_is_hidden_when_stderr_is_not_a_terminal() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    for i in 0..600 {
+        fs::write(base.join(format!("{i}.txt")), "").unwrap();
+    }
+
+    // `-P` is still accepted, and has nothing to draw on a pipe
+    for args in [&["-d"][..], &["-d", "-P"], &["-y", "-g", "*.txt"]] {
+        let out = reclean(base, args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{:?}", err);
+        assert!(!err.contains("scanning"), "{:?}", err);
+        assert!(!err.contains("removing"), "{:?}", err);
+        assert!(!err.contains('\r'), "{:?}", err);
+    }
 }
 
 #[test]
@@ -369,10 +410,37 @@ fn test_color_auto_and_never_leave_piped_output_plain() {
 
     for args in [&["-d"][..], &["-d", "--color", "never"]] {
         let out = reclean(base, args);
-        let err = String::from_utf8_lossy(&out.stderr);
+        let report = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success());
-        assert!(err.contains("a.pyc"), "{:?}", err);
-        assert!(!err.contains('\x1b'), "{:?}", err);
+        assert!(report.contains("a.pyc"), "{:?}", report);
+        assert!(!report.contains('\x1b'), "{:?}", report);
+        assert!(!out.stderr.contains(&b'\x1b'), "{:?}", out.stderr);
+    }
+}
+
+#[test]
+fn test_report_goes_to_stdout_and_warnings_to_stderr() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    let out = reclean(base, &["-y", "-p", "missing"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty(), "{:?}", out.stdout);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error: "));
+
+    let out = reclean(base, &["-y"]);
+    let report = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success());
+    for line in [
+        "Matched targets:",
+        "  a.pyc",
+        "1 target, ",
+        "Deleted 1 item(s)",
+    ] {
+        assert!(report.contains(line), "{:?}", report);
+        assert!(!err.contains(line), "{:?}", err);
     }
 }
 
@@ -394,4 +462,42 @@ fn test_color_flag_reaches_clap_help_and_errors() {
         let out = reclean(base, args);
         assert!(!String::from_utf8_lossy(&out.stdout).contains('\x1b'));
     }
+}
+
+#[test]
+fn test_report_paths_are_relative_to_the_root() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::create_dir_all(base.join("sub/pkg/__pycache__")).unwrap();
+
+    let out = reclean(base, &["-d", "-p", "sub"]);
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(report.contains("\n  pkg/__pycache__/  "), "{:?}", report);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_report_escapes_control_characters_in_names() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a\x1b[31m.pyc"), "").unwrap();
+
+    let out = reclean(base, &["-d", "--color", "never"]);
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(!report.contains('\x1b'), "{:?}", report);
+    assert!(report.contains("a\\u{1b}[31m.pyc"), "{:?}", report);
+}
+
+#[test]
+fn test_verbose_lists_each_removal() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = temp_dir.path();
+    fs::write(base.join("a.pyc"), "").unwrap();
+
+    let out = reclean(base, &["-y", "-v", "--color", "never"]);
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success());
+    assert!(report.contains("\n  removed  a.pyc\n"), "{:?}", report);
 }

@@ -62,13 +62,12 @@ Options:
   -s, --stats                   Display statistics by pattern
   -o, --older-than <DURATION>   Only remove targets older than this duration (e.g., "30d", "7d", "24h")
       --larger-than <SIZE>      Only remove targets of at least this size (e.g., "100M", "1.5G", "4096")
-  -P, --progress                Show progress bar during scanning
       --no-protect              Match inside protected (.git, .ssh, ...) and excluded-by-default (.venv) directories
   -v, --verbose                 Increase verbosity (debug-level logging)
   -q, --quiet                   Suppress all output except errors
       --completions <SHELL>     Generate shell completions (bash, zsh, fish, elvish, powershell) [possible values: bash, elvish, fish, powershell, zsh]
       --format <FORMAT>         Output format (text or json) [default: text] [possible values: text, json]
-      --color <WHEN>            When to colour stderr output (auto: on a terminal, unless NO_COLOR is set) [default: auto] [possible values: auto, always, never]
+      --color <WHEN>            When to colour output (auto: on a terminal, unless NO_COLOR is set) [default: auto] [possible values: auto, always, never]
   -l, --list                    List default patterns, excludes, protected, artifact and dependency names
   -h, --help                    Print help
   -V, --version                 Print version
