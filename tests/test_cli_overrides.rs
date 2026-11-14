@@ -473,7 +473,9 @@ fn test_report_paths_are_relative_to_the_root() {
     let out = reclean(base, &["-d", "-p", "sub"]);
     let report = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success());
-    assert!(report.contains("\n  pkg/__pycache__/  "), "{:?}", report);
+    // Native separators inside the path; `/` marks a directory
+    let expected = format!("\n  pkg{}__pycache__/  ", std::path::MAIN_SEPARATOR);
+    assert!(report.contains(&expected), "{:?}", report);
 }
 
 #[cfg(unix)]
