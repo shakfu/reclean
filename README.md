@@ -301,7 +301,7 @@ Each match is listed with its size, followed by a total. A run with more than on
 
 The prompt takes a single keypress. `y` proceeds; anything else cancels. Keys typed before the prompt appears are discarded. When stdin is not a terminal, one character is read from it instead, so `echo y | reclean` works; end of input cancels.
 
-Targets are removed in parallel. Results are reported in list order.
+Targets are removed in parallel. A target with 4096 or more entries is itself split across all cores. Results are reported in list order.
 
 ## Age Filter
 

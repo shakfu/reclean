@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
 
 ### Changed
 
+- A directory target with 4096 or more entries is emptied by all cores, not one. Targets already ran in parallel, so a single large `node_modules` or `target/` used one thread. A 106k-entry `node_modules` took 1.32 s against cclean's 0.23 s; it now takes 0.22 s on 16 cores. The split is ported from cclean: the top levels are opened breadth first and their entries handed to workers, which descend only through descriptors, so no symlink is followed. Large targets run one at a time, since each already uses every core. Unix only; Windows still uses `remove_dir_all`.
+
 - The report goes to stdout, as in cclean: matched targets, totals, statistics and deletions. Warnings, errors, notes, progress and the prompt stay on stderr. `reclean > list.txt` now captures the list, and `2>/dev/null` no longer hides it. The library still prints nothing itself. It logs report lines under the new `reclean::REPORT_TARGET`, and the CLI logger routes that target to stdout. `--color` is decided per stream.
 
 - The matched list follows cclean's format. It prints a `Matched targets:` header, then one line per target: the path relative to the root, the size, and the restore command. A directory ends in `/`, so its type shows without colour. Paths are printed bare rather than in `{:?}` quotes. Control characters, and backslashes outside Windows, are escaped, so a file name cannot write escape sequences to the terminal. The total reads `1 target` / `N targets`.

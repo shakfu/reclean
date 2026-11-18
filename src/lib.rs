@@ -1588,30 +1588,37 @@ impl CleaningJob {
         } else {
             ProgressBar::hidden()
         };
+        let remove_one = |i: usize| {
+            let target = &targets[i];
+            let result = match target.path.strip_prefix(walk_root) {
+                Ok(rel) => remove_target(base_path, rel, &target.scanned, target.entries, &|| {
+                    progress.inc(1)
+                }),
+                Err(_) => Err("is not below the working directory".to_string()),
+            };
+            let _ = results[i].set(result);
+        };
+        // A large target is split across the cores itself, so large ones run one
+        // at a time after the rest; inside the pool each would start its own.
+        let (large, small): (Vec<usize>, Vec<usize>) =
+            (0..targets.len()).partition(|&i| splits(targets[i].entries));
         let next = AtomicUsize::new(0);
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
-            .min(targets.len());
+            .min(small.len());
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(target) = targets.get(i) else {
+                    let n = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = small.get(n) else {
                         return;
                     };
-                    let result = match target.path.strip_prefix(walk_root) {
-                        Ok(rel) => {
-                            remove_target(base_path, rel, &target.scanned, target.entries, &|| {
-                                progress.inc(1)
-                            })
-                        }
-                        Err(_) => Err("is not below the working directory".to_string()),
-                    };
-                    let _ = results[i].set(result);
+                    remove_one(i);
                 });
             }
         });
+        large.into_iter().for_each(remove_one);
         progress.finish_and_clear();
 
         for (target, result) in targets.iter().zip(results) {
@@ -1697,15 +1704,21 @@ fn changed_since_scan(path: &Path, scanned: &Scanned, base_path: &Path) -> Optio
 }
 
 /// Remove `rel`, a target below `root`, unless it changed since the scan
+/// Whether a target with `entries` below it is emptied across all cores.
+/// Below 4096 entries one thread takes a few milliseconds. Elsewhere than Unix,
+/// removal goes through `remove_dir_all`, which cannot be split.
+fn splits(entries: u64) -> bool {
+    cfg!(unix) && entries >= 4096
+}
+
 /// `on_unlink` is called once per entry removed, the target itself included;
 /// `entries` is how many the scan counted below it.
 fn remove_target(
     root: &Path,
     rel: &Path,
     scanned: &Scanned,
-    // Unix removal reports each entry itself
-    #[cfg_attr(unix, allow(unused_variables))] entries: u64,
-    on_unlink: &dyn Fn(),
+    entries: u64,
+    on_unlink: &(dyn Fn() + Sync),
 ) -> std::result::Result<(), String> {
     let metadata = &scanned.metadata;
     if !(metadata.is_dir() || metadata.is_file() || metadata.is_symlink()) {
@@ -1713,7 +1726,7 @@ fn remove_target(
     }
     #[cfg(unix)]
     {
-        remove::remove(root, rel, metadata, on_unlink)
+        remove::remove(root, rel, metadata, splits(entries), on_unlink)
     }
     #[cfg(not(unix))]
     {
@@ -1943,6 +1956,115 @@ mod tests {
         assert_eq!(result, Ok(()));
         // The entries, then the target itself
         assert_eq!(unlinked.into_inner(), 5);
+    }
+
+    /// A tree `depth` levels deep with 4 subdirectories and a file per level, so
+    /// a split holds the top levels open and hands the rest to workers.
+    #[cfg(unix)]
+    fn deep_tree(target: &Path, depth: usize) {
+        fs::create_dir_all(target).unwrap();
+        fs::write(target.join("f"), "x").unwrap();
+        if depth > 0 {
+            for i in 0..4 {
+                deep_tree(&target.join(format!("d{i}")), depth - 1);
+            }
+        }
+    }
+
+    /// An entry count that makes `remove_target` split.
+    #[cfg(unix)]
+    fn split_entries() -> u64 {
+        assert!(splits(4096) && !splits(4095));
+        4096
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn split_removal_reports_every_entry() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let target = base.join("node_modules");
+        deep_tree(&target, 6);
+        let scanned = Scanned::of(&target).unwrap();
+        let warnings = Mutex::new(Vec::new());
+        let entries = parallel_dir_sizes(
+            std::slice::from_ref(&target),
+            None,
+            &warnings,
+            &ProgressBar::hidden(),
+        )[0]
+        .1;
+
+        let unlinked = AtomicU64::new(0);
+        let on_unlink = || {
+            unlinked.fetch_add(1, Ordering::Relaxed);
+        };
+        let result = remove_target(
+            &base,
+            Path::new("node_modules"),
+            &scanned,
+            split_entries(),
+            &on_unlink,
+        );
+        assert_eq!(result, Ok(()));
+        assert!(!target.exists());
+        assert_eq!(unlinked.into_inner(), entries + 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn split_removal_unlinks_symlinks_without_following() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::write(outside.path().join("precious"), "x").unwrap();
+        let target = base.join("node_modules");
+        deep_tree(&target, 3);
+        // One link where the split opens directories, one where workers do
+        std::os::unix::fs::symlink(outside.path(), target.join("top")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), target.join("d0/d1/d2/deep")).unwrap();
+        let scanned = Scanned::of(&target).unwrap();
+
+        let result = remove_target(
+            &base,
+            Path::new("node_modules"),
+            &scanned,
+            split_entries(),
+            &|| {},
+        );
+        assert_eq!(result, Ok(()));
+        assert!(!target.exists());
+        assert!(outside.path().join("precious").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn split_removal_reports_a_failure_and_removes_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        // root ignores directory permissions, so the failure cannot be staged
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let base = temp_dir.path().canonicalize().unwrap();
+        let target = base.join("node_modules");
+        deep_tree(&target, 4);
+        let locked = target.join("d1/d2");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let scanned = Scanned::of(&target).unwrap();
+
+        let result = remove_target(
+            &base,
+            Path::new("node_modules"),
+            &scanned,
+            split_entries(),
+            &|| {},
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.unwrap_err().contains("ermission denied"));
+        assert!(locked.join("f").exists());
+        assert!(!target.join("d0").exists());
+        assert!(!target.join("d3").exists());
     }
 
     #[test]
